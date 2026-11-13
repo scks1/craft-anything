@@ -1697,7 +1697,7 @@ pub(crate) mod tests {
         let path = logged[0].clone().expect("the error names its log");
         assert_eq!(written(), std::slice::from_ref(&path));
         let text = std::fs::read_to_string(&path).unwrap();
-        for part in ["What: B (scripted)", "Error: down", "Ran for:", "A request for scripted", "craft-anything-cli ai test B"] {
+        for part in ["What: B (scripted)", "Error: engine_missing", "Ran for:", "A request for scripted", "craft-anything-cli ai test B"] {
             assert!(text.contains(part), "{part}: {text}");
         }
         for message in ["xyzzy", "plugh"] {

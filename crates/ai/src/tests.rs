@@ -891,13 +891,51 @@ fn a_failed_api_turn_leaves_a_log_without_the_key_or_the_message() {
     let written = std::fs::read_dir(&logs).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("agent-")).count();
     assert_eq!(written, 2);
     let address = format!("A request to {url}/v1/messages");
-    for part in ["What: Claude (", "Diagnosis: The API key was rejected", "\"status\":401", "authentication_error", "Ran for:", &address] {
+    for part in ["What: Claude (", "Diagnosis: The API key was rejected", "HTTP status: 401", "authentication_error", "Ran for:", &address] {
         assert!(texts[0].contains(part), "{part}: {}", texts[0]);
     }
-    assert!(texts[1].contains("Error: The answer stream ended early."), "{}", texts[1]);
+    assert!(texts[1].contains("Error: truncated"), "{}", texts[1]);
     for text in &texts {
         for hidden in [key, "xyzzy", "plugh", "Half an ans"] {
             assert!(!text.contains(hidden), "{hidden}: {text}");
+        }
+    }
+}
+
+/// A service, or a proxy in front of it, can repeat the key or part of the request in its error:
+/// in a JSON error's message or code, in a plain-text body, or in a stream's error event. None of
+/// it reaches the failure log, in the error, its details or the advice (ROADMAP R5.5).
+#[test]
+fn a_failure_log_leaves_out_what_the_service_repeats_of_the_key_and_the_request() {
+    let key = "fake-key-0042-not-real";
+    let echoed = "quokka-umbrella";
+    let reflected = format!("key {key} may not ask about the {echoed}");
+    let stream_error = sse(&[
+        json!({"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":5}}}),
+        json!({"type":"error","error":{"type":"invalid_request_error","message":reflected}}),
+    ]);
+    let (url, _seen) = mock(vec![
+        (401, "application/json", json!({"type":"error","error":{"type":key,"message":reflected}}).to_string()),
+        (400, "text/plain", format!("Rejected by the proxy: {reflected}")),
+        (200, "text/event-stream", stream_error),
+    ]);
+    let (h, _d) = hub();
+    add(&h, "Claude", BackendKind::Anthropic, &url, Some(key));
+    let mut c = h.start(Some("Claude"), false).unwrap();
+    let expected: [&[&str]; 3] = [
+        &["Error: no_permission", "HTTP status: 401", "Diagnosis: The API key was rejected"],
+        &["Error: bad_input", "HTTP status: 400", "Diagnosis: "],
+        &["Error: program_failed", "The service's error code: invalid_request_error", "Diagnosis: Try again"],
+    ];
+    for (n, parts) in expected.iter().enumerate() {
+        let ev = run(&mut c, &format!("a question about the {echoed}, take {n}"));
+        let log = ev.iter().find_map(|e| if let AgentEvent::Error { log, .. } = e { log.clone() } else { None });
+        let text = std::fs::read_to_string(log.unwrap_or_else(|| panic!("no log for take {n}: {ev:?}"))).unwrap();
+        for hidden in [key, echoed] {
+            assert!(!text.contains(hidden), "take {n}, {hidden}: {text}");
+        }
+        for part in *parts {
+            assert!(text.contains(part), "take {n}, {part}: {text}");
         }
     }
 }

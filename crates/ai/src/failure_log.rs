@@ -2,8 +2,8 @@
 //! what it printed, and what we made of it. They stay on this computer, readable only by its
 //! owner. The person's message is never written, and secret-looking flags are masked
 //! ([`craft_anything_platform::process::printable_command`]). Agent apps' runs write them, and so
-//! do API backends' turns ([`write_api_failure`], without the request or the key) and a tool
-//! server that can't start (`craft-anything-cli mcp`).
+//! do API backends' turns ([`write_api_failure`], without the request, the key or the service's
+//! message) and a tool server that can't start (`craft-anything-cli mcp`).
 
 use craft_anything_evidence::{ErrorCode, ToolError};
 use std::path::{Path, PathBuf};
@@ -89,10 +89,11 @@ pub fn write(dir: &Path, report: &Report) -> Result<PathBuf, ToolError> {
 }
 
 /// Write the log for an API backend's turn that failed for good: the backend and model, the
-/// address the request went to (without a user name, password or query), the error with what the
-/// service said about it (its HTTP status and error code, in `error`'s details), and how long the
-/// request ran. The request itself, with the person's message and the key, is not written. Returns
-/// the log's path, or what to tell the person when it couldn't be written.
+/// address the request went to (without a user name, password or query), the error as
+/// [`api_error_summary`] gives it, the advice shown with it, and how long the request ran. The
+/// request itself, with the person's message and the key, is not written, and neither is the
+/// service's message, which can repeat them. Returns the log's path, or what to tell the person
+/// when it couldn't be written.
 pub fn write_api_failure(
     dir: &Path,
     backend: &str,
@@ -109,10 +110,7 @@ pub fn write_api_failure(
         },
         check: format!("craft-anything-cli ai test {}", crate::ssh::shell_quote(backend)),
         diagnosis: error.remediation.clone(),
-        error: Some(match &error.details {
-            Some(d) => format!("{}\n{d}", error.message),
-            None => error.message.clone(),
-        }),
+        error: Some(api_error_summary(error)),
         duration: Some(ran_for),
         ..Report::default()
     };
@@ -126,6 +124,41 @@ pub fn write_api_failure(
             (None, Some(format!("The details couldn't be saved: {e}")))
         }
     }
+}
+
+/// What a log keeps of an API error: Craft Anything's code for it, and the fields from the
+/// service that can't carry its text: the HTTP status, its error code when it is written like one,
+/// the context window and request size it gave, and how long it asked to wait. Its message and any
+/// other text it sent are left out, because a service or a proxy in front of it can repeat the key
+/// or part of the request there. The person saw the message with the error.
+fn api_error_summary(error: &ToolError) -> String {
+    let code = serde_json::to_value(error.code).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "unknown".into());
+    let mut s = format!("{code} (the service's message is left out)");
+    let field = |k: &str| error.details.as_ref().and_then(|d| d.get(k));
+    let number = |k: &str| field(k).and_then(serde_json::Value::as_u64);
+    if let Some(status) = number("status") {
+        s.push_str(&format!("\nHTTP status: {status}"));
+    }
+    if let Some(p) = field("provider_error").and_then(serde_json::Value::as_str).filter(|p| looks_like_error_code(p)) {
+        s.push_str(&format!("\nThe service's error code: {p}"));
+    }
+    if let Some(w) = number("context_window") {
+        s.push_str(&format!("\nContext window: {w} tokens"));
+    }
+    if let Some(t) = number("prompt_tokens") {
+        s.push_str(&format!("\nThe request: {t} tokens"));
+    }
+    if let Some(r) = number("retry_after_secs") {
+        s.push_str(&format!("\nAsked to wait: {r} s"));
+    }
+    s
+}
+
+/// An error code as services write them (`authentication_error`, `invalid_api_key`): lower-case
+/// letters and underscores, at least one underscore, at most 64 characters. Other text, digits
+/// included, could be a key or words from the request.
+fn looks_like_error_code(code: &str) -> bool {
+    code.len() <= 64 && code.contains('_') && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
 /// A URL as a log shows it: without a user name, password, query or fragment.
@@ -191,15 +224,16 @@ mod tests {
         for part in [
             "What: My Claude (claude-x)",
             "Diagnosis: The API key was rejected.",
-            "Error: invalid x-api-key",
-            "\"status\":401",
+            "Error: no_permission (the service's message is left out)",
+            "HTTP status: 401",
+            "The service's error code: authentication_error",
             "Ran for: 1.5 s",
             "A request to https://api.example/v1/messages for claude-x",
             "craft-anything-cli ai test 'My Claude'",
         ] {
             assert!(text.contains(part), "{part}: {text}");
         }
-        for hidden in ["user:pw", "key=abc"] {
+        for hidden in ["user:pw", "key=abc", "invalid x-api-key"] {
             assert!(!text.contains(hidden), "{hidden}: {text}");
         }
         // A log folder that can't be made: no log, and a note for the person instead.
