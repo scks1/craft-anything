@@ -567,7 +567,10 @@ been run live.
       model is loaded, so say it's unknown until then), how much of it the prompt and tool list
       take, and what that leaves for the build. The four recorded local calculator builds
       (RTX 5090) got no further than a project that compiled with cargo's "Hello, world!" still
-      in it. Builds on the context-size line above
+      in it; nothing recorded shows the window ran out. Show the room left as an estimate: keep
+      space for the answer and the server's own tokens, count the conversation and tool results
+      as they grow, work it out again when the model changes, and never show an unknown window
+      as zero or as a fit. Builds on the context-size line above
 - [x] The first run's AI step can add a model server on another computer by its address (llama.cpp,
       Ollama or LM Studio on a home server), the same form as Settings → AI
 - [ ] A chat sent while a llama.cpp router is still loading the model ended after 31 s with "The
