@@ -142,8 +142,11 @@ event and becomes available for the next request.
 Protocol fixtures, a loopback HTTP server, scripted API turns and executable CLI stand-ins cover
 these paths, including cancellation and the retry cap. An executable that exits 1 without a
 structured error resumes its saved session, while typed setup errors retain priority over the
-same exit status. No live provider or paid-model run was performed. The separate source of #64's
-41 attempts remains unverified.
+same exit status. No live provider or paid-model run was performed. #64's 41 attempts were several
+runs: with a stand-in Claude Code whose tool server fails as #64's did, the published 0.2.0 CLI made
+4 attempts in one run (waits of 30, 60 and 90 s) and stopped, and 0.2.0 starts a run only when the
+person asks or an MCP client calls `rebuild_start` or `rebuild_note`. The 0.5.0 CLI made one
+attempt. Both runs were on Linux, not with the macOS app or a real Claude Code.
 
 ### Bun stored-text encoding
 

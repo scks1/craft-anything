@@ -289,9 +289,19 @@ Every round spends the person's money or quota. One that can't do anything shoul
       list. Say what failed and stop (pitfalls: never retry what can't succeed) — commit `f80a16a66834`
 - [x] `worth_retrying` decides on English words in a message (AGENTS.md: structured results). Move
       its other cases (sign-in, credit, a missing install) to the same typed signal — commit `f80a16a66834`
-- [ ] Find what repeated #64's attempts and stop it: it logged 41, about 38 s apart, on 0.2.0, but
+- [x] Find what repeated #64's attempts and stop it: it logged 41, about 38 s apart, on 0.2.0, but
       `turn` allows 3 retries 30, 60 and 90 s apart, there too, so something else starts them
       — claimed: scks1, branch bugfix/r5.3-repeated-attempts-64
+      Nothing in Craft Anything does: with a stand-in Claude Code that fails the same way, the
+      published 0.2.0 CLI made 4 attempts in one run and stopped, and 0.2.0 starts a run only when
+      the person asks (a new project, a message, Try again, Continue, notes left when a run ends)
+      or an MCP client calls `rebuild_start` or `rebuild_note`. So the 41 were several runs. 0.5.0
+      makes one attempt and stops (#552) (STATUS)
+- [ ] Pausing a run while notes wait starts another: `pause` stops the run, and `poll_run`
+      (`ui-egui/src/project.rs`) sends the notes a finished run left as the next message
+      whatever ended it (read in the code at `52f1daa`, not run). Keep them waiting after a
+      pause or a failure that isn't retried (its tools didn't start), and test the run count:
+      one run and one attempt for a tool server that fails at start, none after a pause
 - [x] A rate limit is waited for only on agents with a session: `turn` retries only when
       `agent.session_id()` is set, which API backends and OpenCode's plain adapter never set (read
       in the code, not run). So #148 didn't reach #142, which was OpenCode. Wait and send the turn
