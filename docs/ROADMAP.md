@@ -1738,10 +1738,11 @@ Owner: open · Status: in progress
       which Windows counts without the certificate table), the tool no longer warns that a gap
       could read as different, and a regression puts a gap between sections
       — claimed: muraa-p, branch bugfix/r3.11-publisher-hash-sections
-- [ ] Check the section-by-section file hash against a second implementation: the test kit signs
+- [x] Check the section-by-section file hash against a second implementation: the test kit signs
       fixtures with its own copy of the steps (gaps, section order, data after the last section,
       sections that share bytes), and a file that declares more sections than were read isn't hashed
       — claimed: scks1, branch bugfix/r3.11-authenticode-section-hash
+      Real signed files: 69 still match on Linux (STATUS); none has gaps between sections
 - [x] Preserve source registers and link-register writes for AArch64 returns and authenticated control transfers.
       — claimed: Afloat16, branch bugfix/r3.11-a64-control-registers-20261110
 - [x] AArch64 move-wide immediates lose their value: `movk w9, #0x9249, lsl #16` lifts to
