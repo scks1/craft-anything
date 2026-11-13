@@ -329,7 +329,8 @@ launch or preview was run for this documentation correction.
   with one serverless function reached Ready in 4 min 47 s, 100% alike at 1440, 768 and 390 px
   (round 1's screenshots are identical to the capture's), 4 of 4 claims. The capture held
   screenshots, design tokens, the layout and the visible text, and no HTML, CSS, scripts or requests;
-  the builder's session shows it read only the capture. One question stayed open: what the page's
+  the builder's session shows it saw the site only through the capture (its tool calls, the
+  check record and file hashes: https://github.com/scks1/craft-anything/tree/c0b4d23a48f5290286545678a51bf10e99ad2866). One question stayed open: what the page's
   button shows, because Clean room's state capture never clicks ordinary buttons. The run needed
   `engines.tools.chromium = "/snap/bin/chromium"`: with nothing set, the browser found was
   `/usr/bin/chromium-browser` and Study stopped after 90 s (R5.7). Not checked: an app, a larger

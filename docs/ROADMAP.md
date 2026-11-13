@@ -486,7 +486,8 @@ the Clean room build and the README quick start: Clean room is the default and h
 build, a website's, and the quick start is how every new person begins.
 
 **A signed-in coding agent:**
-- [x] A live Clean room build of a website, checked end to end (Linux, 2026-11-06; STATUS)
+- [x] A live Clean room build of a website, checked end to end except what its button does
+      (Linux, 2026-11-06; STATUS)
       — claimed: scks1 (website half), branch docs/r5.7-clean-room-website-live-run
 - [ ] A live Clean room build of an app, checked end to end: Study sees an app only through
       pictures of its window, so this needs Windows or macOS (R2.4)
