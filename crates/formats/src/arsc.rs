@@ -66,7 +66,7 @@ pub struct Entry {
     pub key: String,
     /// Qualifier string, e.g. `fr`, `es-rMX`, `night-xhdpi`, or `default`.
     pub config: String,
-    /// `language[-rREGION]`, empty for the default locale.
+    /// Android locale qualifier, empty for the default locale.
     pub locale: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
@@ -121,17 +121,43 @@ pub fn config_qualifiers(r: &Reader<'_>, off: usize) -> (String, String) {
         q.push(format!("mcc{mcc}"));
     }
     if let Some(mnc) = get16(6).filter(|&v| v != 0) {
-        q.push(format!("mnc{mnc}"));
+        q.push(format!("mnc{}", if mnc == u16::MAX { 0 } else { mnc }));
     }
     let lang = if size >= 12 { r.slice(off + 8, 2).map(|b| unpack_code(b, b'a')).unwrap_or_default() } else { String::new() };
     let region = if size >= 12 { r.slice(off + 10, 2).map(|b| unpack_code(b, b'0')).unwrap_or_default() } else { String::new() };
-    let mut locale = lang.clone();
-    if !region.is_empty() {
+    // Extended locale fields were appended to ResTable_config. Older
+    // configurations end before one or more of these fields.
+    let subtag = |start: usize, len: usize| {
+        if start + len <= size { r.slice(off + start, len).map(ascii2).unwrap_or_default() } else { String::new() }
+    };
+    let script = if get8(52).unwrap_or(0) == 0 { subtag(36, 4) } else { String::new() };
+    let variant = subtag(40, 8);
+    let numbering = subtag(53, 8);
+    let mut locale = lang;
+    if !locale.is_empty() && (!script.is_empty() || !variant.is_empty() || !numbering.is_empty()) {
+        locale.insert_str(0, "b+");
+        for part in [&script, &region, &variant].into_iter().filter(|p| !p.is_empty()) {
+            locale.push('+');
+            locale.push_str(part);
+        }
+        if !numbering.is_empty() {
+            locale.push_str("+u+nu+");
+            locale.push_str(&numbering);
+        }
+    } else if !locale.is_empty() && !region.is_empty() {
         locale.push_str(&format!("-r{region}"));
     }
     if !locale.is_empty() {
         q.push(locale.clone());
     }
+    let axis = |q: &mut Vec<String>, v: Option<u8>, mask, names: &[(u8, &str)]| {
+        if let Some(key) = v.map(|n| n & mask)
+            && let Some((_, name)) = names.iter().find(|(value, _)| *value == key)
+        {
+            q.push((*name).to_owned());
+        }
+    };
+    axis(&mut q, get8(19), 0x03, &[(1, "neuter"), (2, "feminine"), (3, "masculine")]);
     if let Some(sl) = get8(28) {
         match sl & 0xc0 {
             0x40 => q.push("ldltr".into()),
@@ -162,6 +188,9 @@ pub fn config_qualifiers(r: &Reader<'_>, off: usize) -> (String, String) {
             _ => {}
         }
     }
+    axis(&mut q, get8(48), 0x03, &[(1, "notround"), (2, "round")]);
+    axis(&mut q, get8(49), 0x03, &[(1, "nowidecg"), (2, "widecg")]);
+    axis(&mut q, get8(49), 0x0c, &[(4, "lowdr"), (8, "highdr")]);
     match get8(12) {
         Some(1) => q.push("port".into()),
         Some(2) => q.push("land".into()),
@@ -203,12 +232,14 @@ pub fn config_qualifiers(r: &Reader<'_>, off: usize) -> (String, String) {
         Some(3) => q.push("finger".into()),
         _ => {}
     }
+    axis(&mut q, get8(18), 0x03, &[(1, "keysexposed"), (2, "keyshidden"), (3, "keyssoft")]);
     match get8(16) {
         Some(1) => q.push("nokeys".into()),
         Some(2) => q.push("qwerty".into()),
         Some(3) => q.push("12key".into()),
         _ => {}
     }
+    axis(&mut q, get8(18), 0x0c, &[(4, "navexposed"), (8, "navhidden")]);
     match get8(17) {
         Some(1) => q.push("nonav".into()),
         Some(2) => q.push("dpad".into()),
@@ -247,6 +278,8 @@ pub fn parse(data: &[u8], limits: Limits) -> Result<Table, FormatError> {
     if t != RES_TABLE {
         return Err(FormatError::Malformed(format!("not a resource table (chunk type {t:#x})")));
     }
+    let data = data.get(..size).ok_or_else(|| FormatError::Truncated("resource table payload".into()))?;
+    let r = Reader::new(data);
     let mut table = Table::default();
     let mut global = StringPool::default();
     let mut pos = h;
@@ -258,6 +291,10 @@ pub fn parse(data: &[u8], limits: Limits) -> Result<Table, FormatError> {
         match ct {
             crate::axml::RES_STRING_POOL => match StringPool::parse(data, pos) {
                 Ok(p) => {
+                    if p.strings.len() < p.declared {
+                        table.truncated = true;
+                        table.warnings.push(format!("global string pool was capped at {} of {} strings", p.strings.len(), p.declared));
+                    }
                     table.global_strings = p.declared;
                     global = p;
                 }
@@ -281,15 +318,53 @@ pub fn parse(data: &[u8], limits: Limits) -> Result<Table, FormatError> {
 }
 
 fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table: &mut Table, limits: Limits) {
+    let Some(data) = pos.checked_add(cs).and_then(|end| data.get(..end)) else {
+        table.warnings.push("package runs past its resource table".into());
+        return;
+    };
     let r = Reader::new(data);
     let hsize = usize::from(r.u16_le(pos + 2).unwrap_or(0));
+    if hsize < 284 {
+        table.warnings.push(format!("package at offset {pos}: incomplete header"));
+        return;
+    }
     let id = r.u32_le(pos + 8).unwrap_or(0);
     let name = utf16_fixed(&r, pos + 12, 128);
+    // Older 284-byte packages predate this field. Type names still use the
+    // unshifted chunk ID, while public resource identities include the offset.
+    let type_id_offset = if hsize >= 288 { r.u32_le(pos + 284).unwrap_or(0) } else { 0 };
+    let Ok(type_id_offset) = u8::try_from(type_id_offset) else {
+        table.truncated = true;
+        table.warnings.push(format!("package {name}: type ID offset is outside the one-byte type field"));
+        return;
+    };
     let type_strings = r.u32_le(pos + 268).unwrap_or(0) as usize;
     let key_strings = r.u32_le(pos + 276).unwrap_or(0) as usize;
-    let end = pos + cs;
-    let types = if type_strings != 0 { StringPool::parse(data, pos + type_strings).unwrap_or_default() } else { StringPool::default() };
-    let keys = if key_strings != 0 { StringPool::parse(data, pos + key_strings).unwrap_or_default() } else { StringPool::default() };
+    let end = data.len();
+    let mut read_pool = |offset: usize, label: &str| {
+        if offset == 0 {
+            return StringPool::default();
+        }
+        let Some(start) = pos.checked_add(offset).filter(|&start| offset >= hsize && start < end) else {
+            table.warnings.push(format!("package {name}: {label} string pool is outside its payload"));
+            return StringPool::default();
+        };
+        match StringPool::parse(data, start) {
+            Ok(pool) => {
+                if pool.strings.len() < pool.declared {
+                    table.truncated = true;
+                    table.warnings.push(format!("package {name}: {label} string pool was capped at {} of {} strings", pool.strings.len(), pool.declared));
+                }
+                pool
+            }
+            Err(error) => {
+                table.warnings.push(format!("package {name}: {label} string pool: {error}"));
+                StringPool::default()
+            }
+        }
+    };
+    let types = read_pool(type_strings, "type");
+    let keys = read_pool(key_strings, "key");
     let mut package = Package { id, name: name.clone(), types: Vec::new(), keys: keys.declared, libraries: Vec::new() };
     let p = Pkg { name: &name, id, types: &types, keys: &keys };
     let mut c = pos.saturating_add(hsize.max(8));
@@ -298,16 +373,23 @@ fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table:
             table.warnings.push(format!("package {name}: unreadable chunk at offset {c}"));
             break;
         };
-        match ct {
-            RES_TYPE_SPEC => {
-                let tid = r.u8(c + 8).unwrap_or(0);
+        // Each child was checked against its package; reads within it must also stop before
+        // the next sibling, including fixed-width library records and bag headers.
+        let Some(child) = data.get(..c.saturating_add(sz)) else {
+            table.warnings.push(format!("package {name}: child chunk runs past its package"));
+            break;
+        };
+        let r = Reader::new(child);
+        let local_tid = r.u8(c + 8).unwrap_or(0);
+        let type_id = local_tid.checked_add(type_id_offset).filter(|_| local_tid != 0);
+        match (ct, type_id) {
+            (RES_TYPE_SPEC, Some(tid)) if ch >= 16 => {
                 let count = r.u32_le(c + 12).unwrap_or(0);
                 if !package.types.iter().any(|t| t.id == tid) && package.types.len() < 256 {
-                    package.types.push(TypeInfo { id: tid, name: type_name(&p, tid), entry_count: count, configs: Vec::new() });
+                    package.types.push(TypeInfo { id: tid, name: type_name(&p, local_tid), entry_count: count, configs: Vec::new() });
                 }
             }
-            RES_TYPE => {
-                let tid = r.u8(c + 8).unwrap_or(0);
+            (RES_TYPE, Some(tid)) if ch >= 24 => {
                 let (cfg, _) = config_qualifiers(&r, c + 20);
                 match package.types.iter_mut().find(|t| t.id == tid) {
                     Some(t) => {
@@ -317,20 +399,36 @@ fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table:
                     }
                     None => {
                         if package.types.len() < 256 {
-                            package.types.push(TypeInfo { id: tid, name: type_name(&p, tid), entry_count: r.u32_le(c + 12).unwrap_or(0), configs: vec![cfg] })
+                            package.types.push(TypeInfo {
+                                id: tid,
+                                name: type_name(&p, local_tid),
+                                entry_count: r.u32_le(c + 12).unwrap_or(0),
+                                configs: vec![cfg],
+                            })
                         }
                     }
                 }
-                parse_type(&r, c, ch, sz, &p, global, table, limits);
+                parse_type(&r, c, ch, sz, &p, tid, global, table, limits);
             }
-            RES_LIBRARY => {
+            (RES_TYPE_SPEC | RES_TYPE, None) if ch >= 16 => {
+                table.truncated = true;
+                table.warnings.push(format!("package {name}: type ID {local_tid} with offset {type_id_offset} is outside the one-byte type field"));
+            }
+            (RES_LIBRARY, _) if ch >= 12 => {
                 let n = r.u32_le(c + 8).unwrap_or(0) as usize;
-                for i in 0..n.min(256) {
+                let available = (sz - ch) / 260;
+                if n > available {
+                    table.warnings.push(format!("package {name}: library records run past their chunk"));
+                }
+                for i in 0..n.min(256).min(available) {
                     let e = c + ch + i * 260;
                     if let Some(lid) = r.u32_le(e) {
                         package.libraries.push((lid, utf16_fixed(&r, e + 4, 128)));
                     }
                 }
+            }
+            (RES_TYPE_SPEC | RES_TYPE | RES_LIBRARY, _) => {
+                table.warnings.push(format!("package {name}: incomplete chunk header at offset {c}"));
             }
             _ => {}
         }
@@ -343,7 +441,7 @@ fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table:
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, global: &StringPool, table: &mut Table, limits: Limits) {
+fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, type_id: u8, global: &StringPool, table: &mut Table, limits: Limits) {
     let tid = r.u8(c + 8).unwrap_or(0);
     let flags = r.u8(c + 9).unwrap_or(0);
     let count = r.u32_le(c + 12).unwrap_or(0) as usize;
@@ -358,6 +456,10 @@ fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, globa
     let table_bytes = if sparse || off16 { count.saturating_mul(if sparse { 4 } else { 2 }) } else { count.saturating_mul(4) };
     if c.saturating_add(ch).saturating_add(table_bytes) > end {
         table.warnings.push(format!("{tname} ({cfg}): entry table runs past its chunk"));
+        return;
+    }
+    if count != 0 && (entries_start < ch.saturating_add(table_bytes) || entries_start > sz) {
+        table.warnings.push(format!("{tname} ({cfg}): invalid entry data start"));
         return;
     }
     for i in 0..count {
@@ -388,7 +490,7 @@ fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, globa
         }
         let esize = usize::from(r.u16_le(e).unwrap_or(0));
         let eflags = r.u16_le(e + 2).unwrap_or(0);
-        let id = (p.id << 24) | (u32::from(tid) << 16) | (idx & 0xffff);
+        let id = (p.id << 24) | (u32::from(type_id) << 16) | (idx & 0xffff);
         let mut entry = Entry {
             id: format!("{id:#010x}"),
             package: p.name.to_string(),
@@ -412,12 +514,27 @@ fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, globa
         } else {
             entry.key = r.u32_le(e + 4).and_then(|k| p.keys.get(k)).unwrap_or("").to_string();
             if eflags & 0x01 != 0 {
+                if esize < 16 || e.saturating_add(esize) > end {
+                    table.truncated = true;
+                    table.warnings.push(format!("{tname} ({cfg}): incomplete bag header"));
+                    table.entries.push(entry);
+                    continue;
+                }
+                let n = r.u32_le(e + 12).unwrap_or(0) as usize;
+                let mut m = e + esize;
+                if n > (end - m) / 12 {
+                    table.truncated = true;
+                    table.warnings.push(format!("{tname} ({cfg}): incomplete bag data"));
+                    table.entries.push(entry);
+                    continue;
+                }
                 let parent = r.u32_le(e + 8).unwrap_or(0);
                 if parent != 0 {
                     entry.parent = Some(format!("@{parent:#010x}"));
                 }
-                let n = r.u32_le(e + 12).unwrap_or(0) as usize;
-                let mut m = e.saturating_add(esize.max(16));
+                if n > MAX_BAG {
+                    table.truncated = true;
+                }
                 for _ in 0..n.min(MAX_BAG) {
                     if m.saturating_add(12) > end {
                         break;
@@ -479,6 +596,25 @@ mod tests {
         assert_eq!(style.parent.as_deref(), Some("@0x01030005"));
         assert_eq!(style.bag[0].value, "#ff336699");
         assert_eq!(style.config, "night-xhdpi-v21");
+    }
+
+    #[test]
+    fn distinct_locale_scripts_and_variants_keep_separate_keys() {
+        let mut cfg = [0u8; 64];
+        cfg[0] = 64;
+        cfg[8..12].copy_from_slice(b"zhTW");
+        cfg[36..40].copy_from_slice(b"Hant");
+        assert_eq!(config_qualifiers(&Reader::new(&cfg), 0).1, "b+zh+Hant+TW");
+        cfg[36..40].copy_from_slice(b"Hans");
+        assert_eq!(config_qualifiers(&Reader::new(&cfg), 0).1, "b+zh+Hans+TW");
+        cfg[52] = 1; // The inferred script is not part of the requested locale.
+        assert_eq!(config_qualifiers(&Reader::new(&cfg), 0).1, "zh-rTW");
+        cfg[40..45].copy_from_slice(b"POSIX");
+        assert_eq!(config_qualifiers(&Reader::new(&cfg), 0).1, "b+zh+TW+POSIX");
+        cfg[53..57].copy_from_slice(b"latn");
+        assert_eq!(config_qualifiers(&Reader::new(&cfg), 0).1, "b+zh+TW+POSIX+u+nu+latn");
+        cfg[0] = 36; // Bytes beyond the declared configuration are unrelated.
+        assert_eq!(config_qualifiers(&Reader::new(&cfg), 0).1, "zh-rTW");
     }
 
     #[test]

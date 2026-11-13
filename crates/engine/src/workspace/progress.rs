@@ -18,16 +18,21 @@ pub const UNCHANGED_TURN_LIMIT: u32 = 2;
 // Keep state inside an already reserved Craft directory. A project created by an older
 // version may have its own app data named build-progress.json at the root.
 pub const BUILD_PROGRESS_FILE: &str = "inbox/build-progress.json";
-pub const BUILD_PROGRESS_VERSION: u32 = 1;
+pub const BUILD_PROGRESS_VERSION: u32 = 2;
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 100_000;
 const MAX_DEPTH: usize = 64;
 
-const STEPS: &[crate::versioned::Step<Value>] = &[v0_to_v1];
+const STEPS: &[crate::versioned::Step<Value>] = &[v0_to_v1, v1_to_v2];
 const _: () = assert!(STEPS.len() == BUILD_PROGRESS_VERSION as usize);
 
 fn v0_to_v1(doc: &mut Value) -> Result<(), String> {
     if doc.is_object() { Ok(()) } else { Err("the progress record isn't a JSON object".into()) }
+}
+
+/// Version 2 adds `checked`; a version 1 record has no kept check.
+fn v1_to_v2(doc: &mut Value) -> Result<(), String> {
+    v0_to_v1(doc)
 }
 
 /// The app as the builder last left it, and turns since it last changed. Only the rebuild run
@@ -40,11 +45,25 @@ pub struct BuildProgress {
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub unchanged_turns: u32,
+    /// The last check round in which every check worked, and what it looked at; while that
+    /// stays the same, the round's results stand instead of building and starting the app again.
+    #[serde(default)]
+    pub checked: Option<CheckedBuild>,
+}
+
+/// A check round kept with the state it judged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckedBuild {
+    /// A digest of what the round's checks look at, taken after they ran.
+    pub key: String,
+    /// The round in `craft.json`'s `checks` whose results stand.
+    pub round: u32,
 }
 
 impl Default for BuildProgress {
     fn default() -> Self {
-        Self { version: BUILD_PROGRESS_VERSION, fingerprint: None, unchanged_turns: 0 }
+        Self { version: BUILD_PROGRESS_VERSION, fingerprint: None, unchanged_turns: 0, checked: None }
     }
 }
 
@@ -63,22 +82,20 @@ impl BuildProgress {
         if bytes.len() as u64 > MAX_RECORD_BYTES {
             return Err(ToolError::new(ErrorCode::OverLimit, format!("{BUILD_PROGRESS_FILE} is too large to read.")));
         }
-        let mut doc: Value = serde_json::from_slice(&bytes).map_err(|e| ToolError::invalid(format!("Couldn't read {BUILD_PROGRESS_FILE}: {e}")))?;
+        let mut doc: Value = serde_json::from_slice(&bytes).map_err(|e| not_ours(format!("Couldn't read {BUILD_PROGRESS_FILE}: {e}")))?;
         let found = match doc.get("version") {
             None => 0,
-            Some(v) => {
-                v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| ToolError::invalid(format!("{BUILD_PROGRESS_FILE} has an invalid version.")))?
-            }
+            Some(v) => v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| not_ours(format!("{BUILD_PROGRESS_FILE} has an invalid version.")))?,
         };
         if found > BUILD_PROGRESS_VERSION {
             return Err(ToolError::unsupported(format!("{BUILD_PROGRESS_FILE} was written by a newer Craft Anything, so this build is left alone."))
                 .with_remediation("Update Craft Anything to continue this build."));
         }
-        let version = crate::versioned::upgrade(&mut doc, found, 0, STEPS)
-            .map_err(|e| ToolError::invalid(format!("Couldn't bring {BUILD_PROGRESS_FILE} up to date: {e}")))?;
-        let obj = doc.as_object_mut().ok_or_else(|| ToolError::invalid(format!("{BUILD_PROGRESS_FILE} isn't a JSON object.")))?;
+        let version =
+            crate::versioned::upgrade(&mut doc, found, 0, STEPS).map_err(|e| not_ours(format!("Couldn't bring {BUILD_PROGRESS_FILE} up to date: {e}")))?;
+        let obj = doc.as_object_mut().ok_or_else(|| not_ours(format!("{BUILD_PROGRESS_FILE} isn't a JSON object.")))?;
         obj.insert("version".into(), Value::from(version));
-        serde_json::from_value(doc).map_err(|e| ToolError::invalid(format!("Couldn't read {BUILD_PROGRESS_FILE}: {e}")))
+        serde_json::from_value(doc).map_err(|e| not_ours(format!("Couldn't read {BUILD_PROGRESS_FILE}: {e}")))
     }
 
     pub fn save(&self, root: &Path) -> Result<(), ToolError> {
@@ -124,6 +141,19 @@ impl BuildProgress {
     }
 }
 
+/// A progress record this version can't read and didn't write: something else changed it (a
+/// builder once kept its own notes there). The run still stops, so a builder can't hand itself a
+/// fresh count, but the person is told what happened and how to go on.
+fn not_ours(message: String) -> ToolError {
+    let message = message.trim_end_matches('.');
+    ToolError::invalid(format!(
+        "{message}. This file is Craft Anything's record of the build, and something else changed it (a builder may have kept its own notes there)."
+    ))
+    .with_remediation(format!(
+        "Rename or delete {BUILD_PROGRESS_FILE} in the project's folder, then try again: the count of builder turns that changed nothing starts over."
+    ))
+}
+
 /// The published schema of the progress record (`cargo xtask schemas`).
 pub fn build_progress_schema() -> String {
     let schema = schemars::generate::SchemaSettings::draft2020_12().into_generator().into_root_schema_for::<BuildProgress>();
@@ -137,6 +167,67 @@ impl Workspace {
     pub fn app_fingerprint(&self, stop: &CancelToken) -> Result<String, ToolError> {
         AppFingerprintCache::default().scan(self, stop)
     }
+
+    /// A digest of what a check round looks at: the app's files (as [`Workspace::app_fingerprint`]
+    /// reads them), the names, sizes and times of the files in `reference/` and `capture/` it
+    /// compares with, and `extra` (the folder, kind, stack, mode and plugin checks, from the caller).
+    /// Equal digests mean the same round would judge the same build against the same things.
+    pub fn check_fingerprint(&self, cache: &mut AppFingerprintCache, extra: &[&str], stop: &CancelToken) -> Result<String, ToolError> {
+        let mut hash = Sha256::new();
+        hash.update(b"craft-check-inputs-v1\0");
+        hash.update(cache.scan(self, stop)?.as_bytes());
+        for dir in [self.reference_dir(), self.capture_dir()] {
+            hash.update(b"\0dir\0");
+            let mut visited = 0;
+            stamp_tree(&dir, &dir, &mut hash, &mut visited, 0, stop)?;
+        }
+        for e in extra {
+            hash.update(b"\0extra\0");
+            hash.update(e.as_bytes());
+        }
+        Ok(hex::encode(hash.finalize()))
+    }
+}
+
+/// Names, sizes, kinds and modification times under `dir`, in name order; a missing folder adds
+/// nothing. Bounded like the app scan, and symlinks are recorded, never followed.
+fn stamp_tree(root: &Path, dir: &Path, hash: &mut Sha256, visited: &mut usize, depth: usize, stop: &CancelToken) -> Result<(), ToolError> {
+    if depth > MAX_DEPTH {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("{} is nested too deeply to compare.", root.display())));
+    }
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && depth == 0 => return Ok(()),
+        Err(e) => return Err(ToolError::io(dir.display(), e)),
+    };
+    let mut entries = Vec::new();
+    for entry in read {
+        stop.check()?;
+        let entry = entry.map_err(|e| ToolError::io(dir.display(), e))?;
+        *visited = visited.saturating_add(1);
+        if *visited > MAX_ENTRIES {
+            return Err(ToolError::new(ErrorCode::OverLimit, format!("{} has too many files to compare.", root.display())));
+        }
+        entries.push(entry.path());
+    }
+    entries.sort();
+    for path in entries {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| ToolError::io(path.display(), e))?;
+        let name = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        let kind = if metadata.is_symlink() {
+            "l"
+        } else if metadata.is_dir() {
+            "d"
+        } else {
+            "f"
+        };
+        let modified = metadata.modified().ok().and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+        hash.update(format!("{kind}\0{name}\0{}\0{modified}\n", metadata.len()).as_bytes());
+        if metadata.is_dir() {
+            stamp_tree(root, &path, hash, visited, depth.saturating_add(1), stop)?;
+        }
+    }
+    Ok(())
 }
 
 /// Content digests reused within one build run. The first scan reads the files; subsequent
@@ -562,14 +653,31 @@ mod tests {
         let old = BuildProgress::load(d.path()).unwrap();
         assert_eq!(old.version, BUILD_PROGRESS_VERSION);
         assert!(old.stalled());
+        assert_eq!(old.checked, None);
         old.save(d.path()).unwrap();
-        assert!(std::fs::read_to_string(&path).unwrap().contains("\"version\": 1"));
-        for bad in [r#"{"version":99,"future":true}"#, "not json", r#"{"version":-1}"#, r#"{"app_data":"not a Craft progress record"}"#] {
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"version\": 2"));
+        // A version 1 record has no kept check; a kept one round-trips.
+        std::fs::write(&path, r#"{"version":1,"fingerprint":"previous","unchanged_turns":1}"#).unwrap();
+        assert_eq!(BuildProgress::load(d.path()).unwrap().checked, None);
+        let kept = BuildProgress { checked: Some(CheckedBuild { key: "k".into(), round: 3 }), ..old.clone() };
+        kept.save(d.path()).unwrap();
+        assert_eq!(BuildProgress::load(d.path()).unwrap(), kept);
+        // An OpenCode builder kept its own notes here; the run stops, and says what to do.
+        let builders_notes = r#"{"step":"done","text":"Done: the game builds."}"#;
+        for bad in [r#"{"version":99,"future":true}"#, "not json", r#"{"version":-1}"#, r#"{"app_data":"not a Craft progress record"}"#, builders_notes] {
             std::fs::write(&path, bad).unwrap();
-            assert!(BuildProgress::load(d.path()).is_err());
+            let e = BuildProgress::load(d.path()).unwrap_err();
+            let fix = e.remediation.clone().unwrap_or_default();
+            if bad.contains("99") {
+                assert!(fix.contains("Update Craft Anything"), "{bad}: {fix}");
+            } else {
+                assert!(fix.starts_with("Rename or delete inbox/build-progress.json") && e.message.contains("something else changed it"), "{bad}: {e:?}");
+            }
             assert!(old.save(d.path()).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
         }
+        let e = BuildProgress::load(d.path()).unwrap_err();
+        assert!(e.message.contains("unknown field `step`") && !e.message.contains(".."), "{}", e.message);
         std::fs::write(&path, vec![b' '; MAX_RECORD_BYTES as usize + 1]).unwrap();
         assert_eq!(BuildProgress::load(d.path()).unwrap_err().code, ErrorCode::OverLimit);
     }

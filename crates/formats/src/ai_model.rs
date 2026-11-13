@@ -5,7 +5,7 @@
 use crate::FormatError;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Most metadata entries kept.
 const MAX_METADATA: usize = 65_536;
@@ -39,7 +39,7 @@ pub struct ModelTensor {
     pub parameters: u64,
     /// Where its data starts, relative to the start of the data section.
     pub data_offset: u64,
-    /// Size of its data, when the type has a fixed element size.
+    /// Size of its data, when the type's storage layout and shape are known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_bytes: Option<u64>,
 }
@@ -162,18 +162,21 @@ pub fn parse(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError> 
 
 /// A count in plain words: "7.2 billion".
 pub fn plain_count(n: u64) -> String {
-    let f = n as f64;
-    if n >= 1_000_000_000_000 {
-        format!("{:.1} trillion", f / 1e12)
-    } else if n >= 1_000_000_000 {
-        format!("{:.1} billion", f / 1e9)
-    } else if n >= 1_000_000 {
-        format!("{:.1} million", f / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1} thousand", f / 1e3)
-    } else {
-        n.to_string()
+    const UNITS: [(u64, &str); 4] = [(1_000_000_000_000, "trillion"), (1_000_000_000, "billion"), (1_000_000, "million"), (1_000, "thousand")];
+    // A value that rounds up to 1000.0 of a unit is shown in the next unit up.
+    for (i, (size, name)) in UNITS.iter().enumerate() {
+        if n < *size {
+            continue;
+        }
+        let tenths = (n as f64 / *size as f64 * 10.0).round();
+        if tenths >= 10_000.0
+            && let Some((_, up)) = i.checked_sub(1).and_then(|j| UNITS.get(j))
+        {
+            return format!("1.0 {up}");
+        }
+        return format!("{:.1} {name}", n as f64 / *size as f64);
     }
+    n.to_string()
 }
 
 fn shorten(s: String) -> (String, bool) {
@@ -231,9 +234,6 @@ impl<'a> Cursor<'a> {
     fn raw_str(&mut self) -> Option<&'a [u8]> {
         let n = usize::try_from(self.u64()?).ok()?;
         self.take(n)
-    }
-    fn string(&mut self) -> Option<String> {
-        self.raw_str().map(|b| String::from_utf8_lossy(b).into_owned())
     }
     /// Skip a bounded string without building it, keeping only its first characters.
     fn short_string(&mut self) -> Option<(String, bool)> {
@@ -369,15 +369,49 @@ fn ggml_type_name(t: u32) -> String {
     known.to_string()
 }
 
-/// Bytes per element of the types stored one element at a time.
-fn ggml_element_bytes(t: u32) -> Option<u64> {
-    match t {
-        0 | 26 => Some(4),
-        1 | 25 | 30 => Some(2),
-        24 => Some(1),
-        27 | 28 => Some(8),
-        _ => None,
+/// Type id, weights per on-disk block, and bytes per block (including scales).
+const GGML_BLOCK_LAYOUTS: &[(u32, u64, u64)] = &[
+    (0, 1, 4),
+    (1, 1, 2),
+    (2, 32, 18),
+    (3, 32, 20),
+    (6, 32, 22),
+    (7, 32, 24),
+    (8, 32, 34),
+    (9, 32, 36),
+    (10, 256, 84),
+    (11, 256, 110),
+    (12, 256, 144),
+    (13, 256, 176),
+    (14, 256, 210),
+    (15, 256, 292),
+    (16, 256, 66),
+    (17, 256, 74),
+    (18, 256, 98),
+    (19, 256, 50),
+    (20, 32, 18),
+    (21, 256, 110),
+    (22, 256, 82),
+    (23, 256, 136),
+    (24, 1, 1),
+    (25, 1, 2),
+    (26, 1, 4),
+    (27, 1, 8),
+    (28, 1, 8),
+    (29, 256, 56),
+    (30, 1, 2),
+];
+
+fn ggml_tensor_bytes(t: u32, shape: &[u64], parameters: u64) -> Result<Option<u64>, String> {
+    let Some(&(_, block, bytes)) = GGML_BLOCK_LAYOUTS.iter().find(|&&(id, _, _)| id == t) else {
+        return Ok(None);
+    };
+    // Blocks belong to rows. Multiplying all dimensions first would accept, for
+    // example, two half-block rows as one complete block.
+    if block > 1 && shape.first().is_none_or(|width| !width.is_multiple_of(block)) {
+        return Err(format!("its row width is not a multiple of the {block}-weight block"));
     }
+    (parameters / block).checked_mul(bytes).map(Some).ok_or_else(|| "its tensor byte size overflows".into())
 }
 
 fn is_plain_numeric(name: &str) -> bool {
@@ -431,21 +465,29 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
     r.declared_tensors = tensor_count;
     r.declared_metadata = kv_count;
 
+    // Borrow complete identities: display truncation and retained-entry caps must not
+    // change which binary records are considered duplicates.
+    let mut metadata_keys = BTreeSet::new();
+    let mut tensor_names = BTreeSet::new();
     let mut alignment = 32u64;
     let mut file_type = None;
     let mut ended_early = false;
     let mut i = 0u64;
     while i < kv_count {
         let parsed = (|| {
-            let key = c.string()?;
+            let identity = c.raw_str()?;
+            let key = String::from_utf8_lossy(identity).into_owned();
             let t = c.u32()?;
             let (value, value_type, count, shortened) = gguf_value(&mut c, t, 0)?;
-            Some(ModelMetadata { key, value_type, value, count, shortened })
+            Some((identity, ModelMetadata { key, value_type, value, count, shortened }))
         })();
-        let Some(entry) = parsed else {
+        let Some((identity, entry)) = parsed else {
             ended_early = true;
             break;
         };
+        if !metadata_keys.insert(identity) {
+            return Err(FormatError::Malformed(format!("GGUF duplicate metadata key at index {i}")));
+        }
         r.metadata_read = r.metadata_read.saturating_add(1);
         match entry.key.as_str() {
             "general.architecture" => r.architecture = entry.value.as_str().map(str::to_string),
@@ -463,12 +505,13 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
         i += 1;
     }
 
-    let mut last_data_end = 0u64;
+    let mut last_data_end = 0u128;
     if !ended_early {
         let mut i = 0u64;
         while i < tensor_count {
             let parsed = (|| {
-                let name = c.string()?;
+                let identity = c.raw_str()?;
+                let name = String::from_utf8_lossy(identity).into_owned();
                 let dims = c.u32()?;
                 if dims > MAX_DIMS {
                     return None;
@@ -479,18 +522,31 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
                 }
                 let ty = c.u32()?;
                 let offset = c.u64()?;
-                Some((name, shape, ty, offset))
+                Some((identity, name, shape, ty, offset))
             })();
-            let Some((name, shape, ty, data_offset)) = parsed else {
+            let Some((identity, name, shape, ty, data_offset)) = parsed else {
                 ended_early = true;
                 break;
             };
+            if !tensor_names.insert(identity) {
+                return Err(FormatError::Malformed(format!("GGUF duplicate tensor name at index {i}")));
+            }
             let (parameters, overflow) = element_count(&shape);
             if overflow {
                 r.warn(format!("{name}: its shape multiplies past what a number can hold"));
             }
-            let data_bytes = ggml_element_bytes(ty).and_then(|b| parameters.checked_mul(b));
-            last_data_end = last_data_end.max(data_offset.saturating_add(data_bytes.unwrap_or(0)));
+            let data_bytes = if overflow {
+                None
+            } else {
+                match ggml_tensor_bytes(ty, &shape, parameters) {
+                    Ok(bytes) => bytes,
+                    Err(reason) => {
+                        r.warn(format!("{name}: {reason}"));
+                        None
+                    }
+                }
+            };
+            last_data_end = last_data_end.max(u128::from(data_offset) + u128::from(data_bytes.unwrap_or(0)));
             let (name, _) = shorten(name);
             r.add_tensor(ModelTensor { name, dtype: ggml_type_name(ty), shape, parameters, data_offset, data_bytes });
             i += 1;
@@ -513,9 +569,11 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
                 r.tensors_past_end = r
                     .tensors
                     .iter()
-                    .filter(|t| t.parameters > 0 && start.saturating_add(t.data_offset).saturating_add(t.data_bytes.unwrap_or(0)) > file_size)
+                    .filter(|t| {
+                        t.parameters > 0 && u128::from(start) + u128::from(t.data_offset) + u128::from(t.data_bytes.unwrap_or(0)) > u128::from(file_size)
+                    })
                     .count() as u64;
-                if start.saturating_add(last_data_end) > file_size {
+                if u128::from(start) + last_data_end > u128::from(file_size) {
                     r.warn("The tensor table describes more data than the file holds: it is cut short, or the table is false.".into());
                 }
             }
@@ -530,18 +588,93 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
 // ---------------------------------------------------------------------------------------------
 // safetensors
 
-fn safetensors_element_bytes(dtype: &str) -> Option<u64> {
+fn safetensors_element_bits(dtype: &str) -> Option<u64> {
     match dtype {
-        "BOOL" | "U8" | "I8" => Some(1),
-        "U16" | "I16" | "F16" | "BF16" => Some(2),
-        "U32" | "I32" | "F32" => Some(4),
-        "U64" | "I64" | "F64" | "C64" => Some(8),
+        "F4" => Some(4),
+        "F6_E2M3" | "F6_E3M2" => Some(6),
+        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" | "F8_E8M0" | "F8_E4M3FNUZ" | "F8_E5M2FNUZ" => Some(8),
+        "U16" | "I16" | "F16" | "BF16" => Some(16),
+        "U32" | "I32" | "F32" => Some(32),
+        "U64" | "I64" | "F64" | "C64" => Some(64),
         _ => None,
+    }
+}
+
+/// JSON values whose object keys cannot overwrite an earlier value while being read.
+/// Safetensors forbids duplicate keys, including in tensor descriptions and metadata.
+struct UniqueJson(Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON with distinct keys in each object")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Bool(value)))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueJson(Value::Number(number)))
+                    .ok_or_else(|| E::custom("a non-finite number in a model header"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value.to_owned())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value)))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueJson(value)) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueJson(Value::Array(values)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut object: A) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = object.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("a duplicate key in the safetensors header"));
+                    }
+                    let UniqueJson(value) = object.next_value()?;
+                    values.insert(key, value);
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
 fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError> {
     let declared = safetensors_header_len(prefix).ok_or_else(|| FormatError::Malformed("not a safetensors header".into()))?;
+    if declared > 100_000_000 {
+        return Err(FormatError::TooLarge("the safetensors header exceeds its 100 MB limit".into()));
+    }
     let end = declared.checked_add(8).ok_or_else(|| FormatError::Malformed("the header length overflows".into()))?;
     if end > file_size {
         return Err(FormatError::Malformed(format!("the header claims {declared} bytes, more than the file holds")));
@@ -550,7 +683,7 @@ fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, Forma
         return Err(FormatError::TooLarge(format!("the header is {declared} bytes and only {} were read", prefix.len())));
     }
     let body = usize::try_from(end).ok().and_then(|e| prefix.get(8..e)).ok_or_else(|| FormatError::Truncated("safetensors header".into()))?;
-    let json: Value = serde_json::from_slice(body).map_err(|e| FormatError::Malformed(format!("the header isn't JSON: {e}")))?;
+    let UniqueJson(json) = serde_json::from_slice(body).map_err(|e| FormatError::Malformed(format!("the header isn't JSON: {e}")))?;
     let obj = json.as_object().ok_or_else(|| FormatError::Malformed("the header isn't a JSON object".into()))?;
 
     let mut r = ModelReport::new(ModelFormat::Safetensors, file_size);
@@ -558,6 +691,7 @@ fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, Forma
     r.declared_tensors = obj.keys().filter(|k| k.as_str() != "__metadata__").count() as u64;
     let data_room = file_size - end;
     let mut bad = 0u64;
+    let mut ranges = Vec::new();
     for (key, v) in obj {
         if key == "__metadata__" {
             let Some(m) = v.as_object() else {
@@ -566,17 +700,20 @@ fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, Forma
             };
             r.declared_metadata = m.len() as u64;
             for (mk, mv) in m {
+                let Some(text) = mv.as_str() else {
+                    r.warn(format!("metadata field {mk} is not a string"));
+                    continue;
+                };
                 r.metadata_read = r.metadata_read.saturating_add(1);
                 if r.metadata.len() >= MAX_METADATA {
                     continue;
                 }
-                let text = mv.as_str().map_or_else(|| mv.to_string(), str::to_string);
+                let (shown, shortened) = shorten(text.to_owned());
                 match mk.as_str() {
-                    "architecture" | "modelspec.architecture" if r.architecture.is_none() => r.architecture = Some(text.clone()),
-                    "name" | "modelspec.title" if r.name.is_none() => r.name = Some(text.clone()),
+                    "architecture" | "modelspec.architecture" if r.architecture.is_none() => r.architecture = Some(shown.clone()),
+                    "name" | "modelspec.title" if r.name.is_none() => r.name = Some(shown.clone()),
                     _ => {}
                 }
-                let (shown, shortened) = shorten(text);
                 r.metadata.push(ModelMetadata { key: mk.clone(), value_type: "string".into(), value: json!(shown), count: None, shortened });
             }
             continue;
@@ -597,8 +734,9 @@ fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, Forma
         match data_bytes {
             None => r.warn(format!("{key}: its data ends before it starts")),
             Some(n) => {
-                if let Some(size) = safetensors_element_bytes(dtype)
-                    && parameters.checked_mul(size) != Some(n)
+                ranges.push((from, to));
+                if let Some(bits) = safetensors_element_bits(dtype)
+                    && u128::from(parameters) * u128::from(bits) != u128::from(n) * 8
                 {
                     r.warn(format!("{key}: its shape and type don't fit the {n} bytes it says it holds"));
                 }
@@ -609,6 +747,26 @@ fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, Forma
         }
         let (name, _) = shorten(key.clone());
         r.add_tensor(ModelTensor { name, dtype: dtype.to_string(), shape, parameters, data_offset: from, data_bytes });
+    }
+    // Check all records, including those beyond the display cap. Empty tensors come
+    // before a nonempty range with the same start.
+    ranges.sort_unstable();
+    let mut cursor = 0;
+    let mut overlap = false;
+    let mut gap = false;
+    for (from, to) in ranges {
+        overlap |= from < cursor;
+        gap |= from > cursor;
+        cursor = cursor.max(to);
+    }
+    if overlap {
+        r.warn("Tensor data ranges overlap.".into());
+    }
+    if gap {
+        r.warn("There is an unclaimed gap between tensor data offsets.".into());
+    }
+    if cursor < data_room {
+        r.warn("The file has unclaimed bytes after the last tensor.".into());
     }
     r.tensors.sort_by_key(|t| t.data_offset);
     if r.tensors_past_end > 0 {

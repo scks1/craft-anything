@@ -228,3 +228,41 @@ fn foreign_entry_with_our_name_is_replaced_but_not_uninstalled() {
     let p = plan(&fx.host, &req(&fx, &["cursor"])).unwrap();
     assert!(p.actions[0].reason.as_deref().unwrap_or_default().contains("replaced"));
 }
+
+#[test]
+fn setup_keeps_a_crlf_config_crlf_and_a_second_run_changes_nothing() {
+    let fx = fixture();
+    let path = fx.host.home.join(".hermes/config.yaml");
+    let crlf = HERMES.replace('\n', "\r\n");
+    std::fs::write(&path, &crlf).unwrap();
+    let r = req(&fx, &["hermes"]);
+    assert_eq!(apply(&plan(&fx.host, &r).unwrap()).status, "configured");
+    let after = read(&path);
+    assert_eq!(after.matches('\n').count(), after.matches("\r\n").count(), "{after:?}");
+    assert!(after.starts_with(&crlf), "the person's own lines are byte-identical: {after:?}");
+    assert!(after.contains("craft-anything:\r\n"), "{after:?}");
+    assert_eq!(plan(&fx.host, &r).unwrap().change_count(), 0);
+    // A second run leaves the file byte for byte as it was.
+    apply(&plan(&fx.host, &r).unwrap());
+    assert_eq!(read(&path), after);
+    // An LF file stays LF.
+    std::fs::write(&path, HERMES).unwrap();
+    assert_eq!(apply(&plan(&fx.host, &r).unwrap()).status, "configured");
+    assert!(!read(&path).contains('\r'));
+}
+
+/// Repeated ids and aliases produce one write per client and an idempotent installation.
+#[test]
+fn repeated_client_ids_are_applied_once() {
+    let fx = fixture();
+    let request = req(&fx, &["claude_code", "claude-code", "codex", "claude_code"]);
+    let plan = plan(&fx.host, &request).unwrap();
+    assert_eq!(plan.actions.len(), 2);
+    assert_eq!(plan.actions[0].client, "claude_code");
+    assert_eq!(plan.actions[1].client, "codex");
+    let report = apply(&plan);
+    assert_eq!(report.status, "configured", "{report:?}");
+    assert_eq!(report.results.len(), 2);
+    assert!(report.results.iter().all(|r| r.outcome == Outcome::Configured));
+    assert_eq!(apply(&crate::plan::plan(&fx.host, &request).unwrap()).status, "unchanged");
+}

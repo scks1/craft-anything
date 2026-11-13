@@ -1,5 +1,6 @@
-//! Pure, standalone file-format parsers. No workspace dependencies, no I/O, no panics on any input.
+//! Pure, standalone file-format parsers. No workspace dependencies, no panics on any input.
 //! Every parser takes bytes and returns a `Result`; sizes and offsets from the input are checked.
+//! The one exception to bytes in memory is [`zip_file`], which reads an entry from a seekable file.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod ai_model;
@@ -66,6 +67,7 @@ pub mod unreal_texture;
 pub mod verify;
 pub mod wasm;
 pub mod zip;
+pub mod zip_file;
 
 // Native executable formats (ELF, PE, Mach-O, DOS) and their shared helpers.
 pub use binary::{Arch, Binary, Export, Format, Import, ImportSlot, Mitigations, Relocation, Section, Segment, Symbol, SymbolKind, parse_binary};
@@ -110,12 +112,8 @@ pub fn zip_has_entry(data: &[u8], entry: &str) -> bool {
     false
 }
 
-/// True when bytes look like an Electron ASAR archive: a Chromium pickle header whose JSON
-/// starts with `{"files":`.
-pub fn looks_like_asar(data: &[u8]) -> bool {
-    let r = Reader::new(data);
-    matches!(r.u32_le(0), Some(4)) && data.get(16..25) == Some(b"{\"files\":")
-}
+/// The ASAR reader's own check, so format dispatch and the reader agree on what an ASAR is.
+pub use asar::looks_like_asar;
 
 #[cfg(test)]
 mod tests {
@@ -137,8 +135,6 @@ mod tests {
 
     #[test]
     fn asar_header() {
-        let mut a = vec![4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        a.extend_from_slice(b"{\"files\":{}}");
-        assert!(looks_like_asar(&a));
+        assert!(looks_like_asar(&asar::build(&[("a.js", b"a();")])));
     }
 }

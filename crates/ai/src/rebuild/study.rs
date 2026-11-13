@@ -9,8 +9,59 @@ pub(super) fn is_electron_runtime(program: &Path) -> bool {
     program.parent().is_some_and(|dir| dir.join("resources/app.asar").is_file())
 }
 
+/// The program a later run reopens for its builder: the one the study looked at, in Deep mode on a
+/// local target, when it is still there. None otherwise (Clean room never opens the original).
+pub(super) fn program_to_reopen(target: &TargetRef, kind: &dyn TargetKind, deep: bool) -> Option<PathBuf> {
+    // Clean room is decided first: locating the program reads the original's folder.
+    if !deep {
+        return None;
+    }
+    let TargetRef::Local { path } = target else { return None };
+    let program = locate(path, kind.studies_folder()).0;
+    program.exists().then_some(program)
+}
+
+/// The builder's tools run on another computer: a coding agent over SSH starts its own tool
+/// server there. An API builder over SSH (a tunnelled model) still calls tools in this process.
+pub(super) fn tools_run_remotely(over_ssh: bool, api_loop: bool) -> bool {
+    over_ssh && !api_loop
+}
+
 impl Worker {
-    pub(super) fn study(&mut self, ws: &mut Workspace, kind: &dyn TargetKind) -> Result<(), ToolError> {
+    /// A run after the first skips the study, so its session has nothing open and the builder's
+    /// first `native_*` calls said "Nothing is open yet" (#1421). Open what the study looked at, so
+    /// the builder's tool server gets it. A failure only says why: the builder can still open it.
+    /// `remote`: the builder's tools run on another computer ([`tools_run_remotely`]), whose tool
+    /// server isn't handed this computer's targets, so opening (and hashing) it here helps nothing.
+    /// `deep`: this run's mode, the same read that decided its capture is usable.
+    pub(super) fn reopen_target(&mut self, ws: &mut Workspace, kind: &dyn TargetKind, remote: bool, deep: bool) -> Result<(), ToolError> {
+        if remote {
+            return Ok(());
+        }
+        // Nothing to look for when something is open already.
+        if !self.engine.session().shared_targets().is_empty() {
+            return Ok(());
+        }
+        let Some(program) = program_to_reopen(&ws.manifest.target, kind, deep) else { return Ok(()) };
+        if let Err(e) = self.call("core_target_open", json!({"path": program.display().to_string()})) {
+            if e.code == ErrorCode::Cancelled {
+                return Err(e);
+            }
+            self.step(ws, Step::Build, Status::Building, &format!("Couldn't open {} again for the builder: {}", program.display(), e.message))?;
+        }
+        Ok(())
+    }
+
+    /// Look at the target before the first build. `deep` is this run's mode, fixed at its start:
+    /// the notes and the capture's recorded mode both come from it.
+    pub(super) fn study(&mut self, ws: &mut Workspace, kind: &dyn TargetKind, deep: bool) -> Result<(), ToolError> {
+        // The capture about to be written belongs to this run's mode. Clear the old record first:
+        // a study that fails partway must not leave a capture a later run trusts.
+        ws.manifest.capture_deep = None;
+        ws.save()?;
+        if !deep {
+            remove_deep_only(&ws.capture_dir())?;
+        }
         match ws.manifest.target.clone() {
             TargetRef::Website { url } => {
                 self.step(ws, Step::Study, Status::Inspecting, &format!("Opening {url} in a private browser…"))?;
@@ -35,11 +86,11 @@ impl Worker {
                     }
                 }
                 self.capture_routes(ws, &url, &widths)?;
-                if !self.engine.session().clean_room() {
+                if deep {
                     self.how_it_works(ws, &url)?;
                 }
             }
-            TargetRef::Local { path } if self.engine.session().clean_room() => self.study_from_outside(ws, &path)?,
+            TargetRef::Local { path } if !deep => self.study_from_outside(ws, &path)?,
             TargetRef::Local { path } => {
                 self.step(ws, Step::Study, Status::Inspecting, "Looking inside it (nothing is run)…")?;
                 let (program, folder) = locate(&path, kind.studies_folder());
@@ -51,7 +102,7 @@ impl Worker {
                     Ok(out) => notes.push_str(&describe(&out)),
                     Err(e) => notes.push_str(&format!("A first look failed: {}\n", e.message)),
                 }
-                if !program.is_file() && !self.engine.session().clean_room() {
+                if !program.is_file() && deep {
                     self.step(
                         ws,
                         Step::Study,
@@ -126,6 +177,8 @@ impl Worker {
                 craft_anything_engine::project::write_atomic(&capture.join("README.md"), b"# No target\n\nBuild from the request alone.\n")?;
             }
         }
+        ws.manifest.capture_deep = Some(deep);
+        ws.save()?;
         Ok(())
     }
 
@@ -177,7 +230,7 @@ impl Worker {
         let tree = capture.join("ui-tree.json");
         let params =
             json!({"program": program.display().to_string(), "wait_secs": 15, "output": shot.display().to_string(), "ui_tree": tree.display().to_string()});
-        let picture = "capture/window.png is a picture of its window 15 seconds after it started. Open it with the Read tool: match its layout, colours and proportions.\n";
+        let picture = "capture/window.png is a picture of its window 15 seconds after it started: match its layout, colours and proportions.\n";
         let mut notes = String::from("\n## How it looks running\n\n");
         notes.push_str(&match self.call("native_window_capture", params) {
             Ok(_) if tree.is_file() => format!(
@@ -285,6 +338,31 @@ impl Worker {
 
 /// Deep mode's notes on how a website works, in capture/.
 pub(super) const HOW_IT_WORKS: &str = "how-it-works.md";
+
+/// The rendered HTML a Deep website capture keeps; a Clean room capture records only what a
+/// visitor sees.
+const PAGE_HTML: &str = "page.html";
+
+/// Remove what only a Deep study writes before a Clean room study replaces the capture: its
+/// builder must not find what only Deep mode may see. A missing file is fine; any other failure
+/// stops the study rather than leave it behind.
+fn remove_deep_only(capture: &Path) -> Result<(), ToolError> {
+    for file in [HOW_IT_WORKS, PAGE_HTML] {
+        let path = capture.join(file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ToolError::io(path.display(), e)),
+        }
+    }
+    let runs = capture.join(kinds::runs::RUNS_DIR);
+    match std::fs::remove_dir_all(&runs) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ToolError::io(runs.display(), e)),
+    }
+    Ok(())
+}
 
 /// A short text view of a tool result for the study notes.
 pub(super) fn describe(out: &ToolOutput) -> String {

@@ -1,14 +1,14 @@
 //! A minimal read-only SquashFS v4.0 reader (little-endian), covering the common cases: gzip, xz,
-//! zstd and lzma compression (and uncompressed blocks), basic and extended directory/file inodes,
+//! zstd, lz4 and lzma compression (and uncompressed blocks), basic and extended directory/file inodes,
 //! data blocks and tail fragments. It walks the tree from the root inode and extracts regular files
 //! and fast symlinks. Bounded against cycles, huge sizes and corrupt references.
 //!
-//! NOT handled (reported in warnings): lzo and lz4 compression, xattrs, and SquashFS versions other
+//! NOT handled (reported in warnings): lzo compression, xattrs, and SquashFS versions other
 //! than 4.0. These make affected files appear unrecovered rather than producing wrong bytes.
 
 use super::{FsEntry, FsImage, FsKind, Limits, join};
 use crate::bytes::Reader;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const META_MAX: usize = 8192;
 
@@ -50,7 +50,8 @@ fn decompress(comp: u16, block: &[u8], max: u64) -> Option<Vec<u8>> {
     match comp {
         1 => crate::firmware::inflate(block, true, max, true).ok().and_then(|i| i.data),
         2 => crate::decompress::lzma(block, max).ok(),
-        4 => crate::decompress::xz(block, max).ok(),
+        4 => crate::decompress::xz_single(block, max).ok(),
+        5 => usize::try_from(max).ok().and_then(|cap| crate::decompress::lz4_block_capped(block, cap).ok()),
         6 => crate::decompress::zstd(block, max).ok(),
         _ => None,
     }
@@ -71,18 +72,26 @@ impl Meta {
             return Meta { data: out, map };
         };
         let end = end.min(data.len());
+        let r = Reader::new(data.get(..end).unwrap_or_default());
         let mut guard = 0usize;
-        while pos + 2 <= end {
+        while pos < end {
             guard += 1;
             if guard > 100_000 || out.len() > 64 << 20 {
                 break;
             }
-            map.insert((pos as u64 - start) as u32, out.len());
-            let r = Reader::new(data);
-            let Some(hdr) = r.u16_le(pos) else { break };
+            let block_start = out.len();
+            let Some(hdr) = r.u16_le(pos) else {
+                warnings.warn("squashfs: a metadata header exceeds its table");
+                warnings.complete = false;
+                break;
+            };
             let uncompressed = hdr & 0x8000 != 0;
             let len = usize::from(hdr & 0x7fff);
-            let Some(block) = data.get(pos + 2..pos + 2 + len) else { break };
+            let Some(block) = r.slice(pos + 2, len) else {
+                warnings.warn("squashfs: a metadata block exceeds its table");
+                warnings.complete = false;
+                break;
+            };
             if uncompressed {
                 out.extend_from_slice(block);
             } else if let Some(d) = decompress(comp, block, META_MAX as u64) {
@@ -92,6 +101,7 @@ impl Meta {
                 warnings.complete = false;
                 break;
             }
+            map.insert((pos as u64 - start) as u32, block_start);
             pos += 2 + len;
         }
         Meta { data: out, map }
@@ -113,32 +123,60 @@ pub fn read(data: &[u8], limits: &Limits) -> FsImage {
         return img;
     };
     let mut img = FsImage::new("squashfs");
-    if matches!(sb.compression, 3 | 5) {
-        img.warn("squashfs uses lzo/lz4 compression, which is not supported");
+    let Some(used) = Reader::new(data).u64_le(40).filter(|&used| used >= 96) else {
+        img.warn("squashfs: invalid filesystem size");
+        img.complete = false;
+        return img;
+    };
+    if used > data.len() as u64 {
+        img.warn("squashfs: image ends before its declared size");
+        img.complete = false;
+    }
+    let data = usize::try_from(used).ok().and_then(|end| data.get(..end)).unwrap_or(data);
+    if sb.inode_table >= used || sb.dir_table > used {
+        img.warn("squashfs: metadata table outside the filesystem");
+        img.complete = false;
+        return img;
+    }
+    if sb.compression == 3 {
+        img.warn("squashfs uses lzo compression, which is not supported");
         img.complete = false;
     }
     // Directory table ends at the first following table.
     let dir_end = [sb.frag_table, sb.id_table].into_iter().filter(|&t| t > sb.dir_table && t != u64::MAX).min().unwrap_or(sb.dir_table);
     let inodes = Meta::read(data, sb.inode_table, sb.dir_table, sb.compression, &mut img);
     let dirs = Meta::read(data, sb.dir_table, dir_end, sb.compression, &mut img);
-    let mut seen: Vec<u64> = Vec::new();
+    let mut seen = BTreeSet::new();
     walk(data, &sb, &inodes, &dirs, sb.root_ref, "", limits, &mut img, 0, &mut seen);
     img
 }
 
 #[allow(clippy::too_many_arguments)]
-fn walk(data: &[u8], sb: &Sb, inodes: &Meta, dirs: &Meta, inode_ref: u64, parent: &str, limits: &Limits, img: &mut FsImage, depth: usize, seen: &mut Vec<u64>) {
+fn walk(
+    data: &[u8],
+    sb: &Sb,
+    inodes: &Meta,
+    dirs: &Meta,
+    inode_ref: u64,
+    parent: &str,
+    limits: &Limits,
+    img: &mut FsImage,
+    depth: usize,
+    seen: &mut BTreeSet<u64>,
+) {
     if depth > limits.max_depth || img.entries.len() >= limits.max_entries {
         img.complete = false;
         return;
     }
-    if seen.contains(&inode_ref) {
+    if !seen.insert(inode_ref) {
         return;
     }
-    seen.push(inode_ref);
-    let Some(pos) = inodes.at(inode_ref) else { return };
     let r = Reader::new(&inodes.data);
-    let Some(itype) = r.u16_le(pos) else { return };
+    let Some((pos, itype)) = inodes.at(inode_ref).and_then(|pos| Some((pos, r.u16_le(pos)?))) else {
+        img.warn("squashfs: directory inode not read");
+        img.complete = false;
+        return;
+    };
     // Directory inode (basic=1, extended=8).
     let (start_block, size, offset) = match itype {
         1 => (r.u32_le(pos + 16), r.u16_le(pos + 24).map(u32::from), r.u16_le(pos + 26)),
@@ -147,10 +185,16 @@ fn walk(data: &[u8], sb: &Sb, inodes: &Meta, dirs: &Meta, inode_ref: u64, parent
     };
     let (Some(start_block), Some(size), Some(offset)) = (start_block, size, offset) else { return };
     // The directory listing lives at (start_block, offset) in the directory table, `size`-3 bytes.
-    let Some(dstart) = dirs.at((u64::from(start_block) << 16) | u64::from(offset)) else { return };
     let listing_len = size.saturating_sub(3) as usize;
-    let Some(end) = dstart.checked_add(listing_len) else { return };
-    let listing = dirs.data.get(dstart..end.min(dirs.data.len())).unwrap_or(&[]);
+    if listing_len == 0 {
+        return;
+    }
+    let listing = dirs.at((u64::from(start_block) << 16) | u64::from(offset)).and_then(|start| dirs.data.get(start..)).unwrap_or_default();
+    let listing = listing.get(..listing_len).unwrap_or_else(|| {
+        img.warn("squashfs: incomplete directory listing");
+        img.complete = false;
+        listing
+    });
     parse_dir(data, sb, inodes, dirs, listing, parent, limits, img, depth, seen);
 }
 
@@ -165,7 +209,7 @@ fn parse_dir(
     limits: &Limits,
     img: &mut FsImage,
     depth: usize,
-    seen: &mut Vec<u64>,
+    seen: &mut BTreeSet<u64>,
 ) {
     let r = Reader::new(listing);
     let mut pos = 0usize;
@@ -242,10 +286,16 @@ fn file_bytes(data: &[u8], sb: &Sb, idata: &[u8], pos: usize, limits: &Limits, i
     }
     let bs = u64::from(sb.block_size);
     let has_fragment = fragment != 0xffff_ffff;
-    let full_blocks = if has_fragment { (file_size / bs) as usize } else { file_size.div_ceil(bs.max(1)) as usize };
+    let full_blocks = if has_fragment { file_size / bs } else { file_size.div_ceil(bs) };
+    if full_blocks > 1 << 20 {
+        img.warn("squashfs: file block count exceeds recovery limit");
+        img.complete = false;
+        return None;
+    }
     let mut out = Vec::with_capacity(usize::try_from(file_size).unwrap_or(0));
     let mut data_pos = blocks_start;
-    for i in 0..full_blocks.min(1 << 20) {
+    for i in 0..usize::try_from(full_blocks).ok()? {
+        let expected = usize::try_from(file_size.saturating_sub(i as u64 * bs).min(bs)).ok()?;
         let Some(bsize) = r.u32_le(list_off + i * 4) else {
             img.warn("squashfs: file block list not read");
             img.complete = false;
@@ -255,18 +305,26 @@ fn file_bytes(data: &[u8], sb: &Sb, idata: &[u8], pos: usize, limits: &Limits, i
         let len = (bsize & 0x00ff_ffff) as usize;
         if len == 0 {
             // Sparse block.
-            out.resize(out.len().saturating_add(sb.block_size as usize), 0);
+            out.resize(out.len().saturating_add(expected), 0);
             continue;
         }
-        let start = usize::try_from(data_pos).ok()?;
-        let block = data.get(start..start.checked_add(len)?)?;
+        let Some(block) = usize::try_from(data_pos).ok().and_then(|start| Reader::new(data).slice(start, len)) else {
+            img.warn("squashfs: file block outside the filesystem");
+            img.complete = false;
+            return None;
+        };
         if uncompressed {
+            if block.len() != expected {
+                img.warn("squashfs: data block length does not match its logical file span");
+                img.complete = false;
+                return None;
+            }
             out.extend_from_slice(block);
         } else {
-            match decompress(sb.compression, block, bs) {
-                Some(d) => out.extend_from_slice(&d),
-                None => {
-                    img.warn("squashfs: a data block did not decompress");
+            match decompress(sb.compression, block, expected as u64) {
+                Some(d) if d.len() == expected => out.extend_from_slice(&d),
+                _ => {
+                    img.warn("squashfs: data block did not decode to its logical file span");
                     img.complete = false;
                     return None;
                 }
@@ -340,6 +398,32 @@ fn fragment_bytes(data: &[u8], sb: &Sb, index: u32, img: &mut FsImage) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xz_container_blocks_do_not_concatenate_streams() {
+        use craft_anything_testkit::firmware as fx;
+        let concatenated = [fx::XZ_FIXTURE, fx::XZ_FIXTURE].concat();
+        assert_eq!(decompress(4, fx::XZ_FIXTURE, fx::XZ_PLAIN.len() as u64).as_deref(), Some(fx::XZ_PLAIN));
+        assert!(decompress(4, fx::XZ_FIXTURE, fx::XZ_PLAIN.len() as u64 - 1).is_none());
+        assert_eq!(decompress(4, &concatenated, fx::XZ_PLAIN.len() as u64).as_deref(), Some(fx::XZ_PLAIN));
+        assert_eq!(crate::decompress::xz(&concatenated, 2 * fx::XZ_PLAIN.len() as u64).unwrap(), [fx::XZ_PLAIN, fx::XZ_PLAIN].concat());
+    }
+
+    #[test]
+    fn truncated_metadata_preserves_only_preceding_blocks() {
+        // Cut the second block inside its two-byte header and inside its payload.
+        let data = [1, 0x80, b'a', 2, 0x80, b'b', b'c'];
+        for (end, warning) in [(3, None), (4, Some("squashfs: a metadata header exceeds its table")), (6, Some("squashfs: a metadata block exceeds its table"))]
+        {
+            let mut img = FsImage::new("squashfs");
+            let meta = Meta::read(&data, 0, end, 1, &mut img);
+            assert_eq!(meta.data, b"a");
+            assert_eq!(meta.at(0), Some(0));
+            assert!(meta.at(3 << 16).is_none());
+            assert_eq!(img.complete, warning.is_none(), "table end {end}");
+            assert_eq!(img.warnings.first().map(String::as_str), warning, "table end {end}");
+        }
+    }
 
     #[test]
     fn reads_a_small_image() {

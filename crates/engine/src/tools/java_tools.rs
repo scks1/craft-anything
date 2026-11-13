@@ -328,7 +328,7 @@ fn ev(ctx: &Ctx<'_>, op: &str, src: &Source, params: Value) -> EvidenceBuilder {
 // ---------------------------------------------------------------------------------------------
 // java_archive_show
 
-fn parse_manifest(bytes: &[u8]) -> BTreeMap<String, String> {
+pub(crate) fn parse_manifest(bytes: &[u8]) -> BTreeMap<String, String> {
     let text = String::from_utf8_lossy(bytes);
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     let mut last_key: Option<String> = None;
@@ -628,7 +628,7 @@ fn java_method_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
                 .map(|i| InsnRow { offset: format!("{:04x}", i.pc), text: cf.format_insn(i), opcode: format!("{:#04x}", i.opcode), len: i.len })
                 .collect();
             if !complete {
-                lims.push(Limitation::new("listing_incomplete", "Decoding stopped at an instruction that runs past the end of the code."));
+                lims.push(Limitation::new("listing_incomplete", "Decoding stopped at an invalid or incomplete instruction."));
             }
             (rows, complete)
         }

@@ -13,10 +13,11 @@ use craft_anything_engine::workspace::Claim;
 use craft_anything_platform::process::Process;
 
 /// What every app and game brief asks for, so the check can see the result.
-pub const SCREENSHOT_CONTRACT: &str = "Give the program a `--screenshot <file.png>` option: start normally, draw about 120 frames, save the window's picture as a PNG to that file and exit. Craft Anything runs it that way after each build to check the result, and a build without the option, or with a blank picture, doesn't pass. Try it yourself: run it with a file inside app/ (for example app/shots/now.png) and look at the picture.";
+pub const SCREENSHOT_CONTRACT: &str = "Give the program a `--screenshot <file.png>` option: start normally, draw about 120 frames, save the window's picture as a PNG to that file and exit. With the option, open the window without taking focus, so a check never gets in the way of what the person is doing, and on Windows also behind other windows (a covered window still draws there; on macOS and Linux it may stop drawing, so don't lower it there). Keep it drawing while it isn't focused, or the picture never comes. In egui: `ViewportBuilder::with_active(false)`, on Windows `with_window_level(WindowLevel::AlwaysOnBottom)`, and on macOS `with_activate_ignoring_other_apps(false)` through `NativeOptions::event_loop_builder`; in Unity, `Application.runInBackground = true`; other stacks, their own way. Started without the option, the program opens as usual. Craft Anything runs it that way after each build to check the result, and a build without the option, or with a blank picture, doesn't pass. Try it yourself: run it with a file inside app/ (for example app/shots/now.png) and check that it saves the picture.";
 
 /// Include the shared catalogue's supported entrypoints so the builder knows how checks start it.
-pub fn contract() -> String {
+/// A builder that can look at pictures is also told to look at its own.
+pub fn contract(sees_pictures: bool) -> String {
     let entries = craft_anything_engine::toolchains::catalogue()
         .iter()
         .filter(|t| !t.launch.is_empty())
@@ -24,7 +25,8 @@ pub fn contract() -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "{SCREENSHOT_CONTRACT} If not packaging an executable, keep a supported entrypoint directly in app/ ({entries}); wildcard entrypoints must match exactly one file."
+        "{SCREENSHOT_CONTRACT}{} If not packaging an executable, keep a supported entrypoint directly in app/ ({entries}); wildcard entrypoints must match exactly one file.",
+        if sees_pictures { " Then open it with Read and look at it." } else { "" }
     )
 }
 
@@ -300,20 +302,31 @@ pub(super) const NO_PROGRAM: &str = "There's no built program to start yet.";
 /// removed first, so only this run's counts).
 pub(super) fn run_with(cx: &CheckCx, option: &str, file: &Path) -> Result<OwnRun, ToolError> {
     let app = cx.ws.app_dir();
+    let file = craft_anything_engine::workspace::absolute(file);
     let godot = cx.godot();
     let Some((program, args)) = launch(&app, godot.as_deref()) else { return Ok(OwnRun::NoProgram) };
+    let program = craft_anything_engine::outputs::absolute_program(&program);
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
     }
-    let _ = std::fs::remove_file(file);
+    let _ = std::fs::remove_file(&file);
     let mut with = args.clone();
-    with.extend(option_args(godot.is_some() && app.join("project.godot").is_file(), option, file));
-    let stop = cx.stop().clone();
-    let out = Process::new(&program).args(&with).cwd(&app).timeout(RUN_LIMIT).stdout_cap(256 * 1024).cancel_when(move || stop.is_cancelled()).run();
+    with.extend(option_args(godot.is_some() && app.join("project.godot").is_file(), option, &file));
+    // A round with a time limit (the builder's own checks) cuts this run at the limit, instead of
+    // waiting out its own 90 s. A pause stops it now, and neither a pause nor a passed limit ever
+    // starts the program.
+    let stop = cx.stop();
+    let timeout = stop.time_left().map_or(RUN_LIMIT, |left| RUN_LIMIT.min(left));
+    stop.check()?;
+    let out = Process::new(&program).args(&with).cwd(&app).timeout(timeout).stdout_cap(256 * 1024).cancel_when(move || stop.paused()).run();
     let Ok(bytes) = std::fs::read(file) else {
         let why = match &out {
             Ok(o) if !o.success => {
-                format!(" It exited with {}: {}", o.code.map_or("an error".into(), |c| format!("code {c}")), last_lines(&o.stderr_text(), &o.stdout_text()))
+                format!(
+                    " It exited with {}: {}",
+                    o.code.map_or("an error".into(), |c| format!("code {c}")),
+                    last_lines(&o.stderr_end_text(), &o.stdout_end_text())
+                )
             }
             Err(e) => format!(" {}", e.message),
             Ok(_) => String::new(),
@@ -441,10 +454,51 @@ mod tests {
     }
 
     #[test]
+    fn a_check_run_is_asked_to_open_behind_without_focus() {
+        // The check starts the program after every build; its window mustn't take over the screen.
+        for sees in [false, true] {
+            let c = contract(sees);
+            assert!(c.contains("open the window without taking focus") && c.contains("with_active(false)"), "{c}");
+            // A covered window may stop drawing on macOS and Linux, so only Windows is asked to lower it.
+            assert!(c.contains("on Windows also behind other windows") && c.contains("don't lower it there"), "{c}");
+            assert!(c.contains("Started without the option, the program opens as usual"), "Play still opens it in front: {c}");
+            assert!(c.contains("Keep it drawing while it isn't focused"), "a player that pauses unfocused never saves: {c}");
+        }
+    }
+
+    #[test]
     fn a_godot_project_gets_its_screenshot_flag_after_a_double_dash() {
         let p = Path::new("/p/checks/round-1/screenshot.png");
         assert_eq!(option_args(false, "--screenshot", p), ["--screenshot", "/p/checks/round-1/screenshot.png"]);
         assert_eq!(option_args(true, "--screenshot", p).first().map(String::as_str), Some("--"));
+    }
+
+    /// A relative project must start its program and pass its option file as absolute paths; the
+    /// child's working folder is app/, so a relative path would be resolved inside app/ again.
+    #[cfg(unix)]
+    #[test]
+    fn option_runs_use_absolute_program_and_file_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = std::env::current_dir().unwrap();
+        let d = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = d.path().strip_prefix(&cwd).unwrap();
+        let ws = Workspace::create(relative, "Game", "a game", TargetRef::None).unwrap();
+        let app = ws.app_dir();
+        std::fs::create_dir_all(app.join("target/debug")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"game\"\n").unwrap();
+        let program = app.join("target/debug/game");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'saved' > \"$2\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let worker = crate::rebuild::tests::check_worker(&ws, false);
+        let cx = CheckCx { worker: &worker, ws: &ws, round: 1, until: None };
+        let file = ws.checks_dir().join("round-1/screenshot.bin");
+        match run_with(&cx, "--screenshot", &file).unwrap() {
+            OwnRun::Saved { bytes, .. } => assert_eq!(bytes, b"saved"),
+            OwnRun::NoProgram => panic!("the built program was found"),
+            OwnRun::NoFile(why) => panic!("the option run saved its file: {why}"),
+        }
     }
 
     #[test]

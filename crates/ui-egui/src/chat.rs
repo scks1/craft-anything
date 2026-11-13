@@ -128,6 +128,7 @@ pub fn suggestions(kind: Option<TargetKind>) -> Vec<&'static str> {
         Some(NetworkCapture) => vec!["Which servers were contacted?", "What data was sent?"],
         Some(Plist) => vec!["What settings are in here?"],
         Some(Evm) => vec!["What does this contract do?", "Who can move funds?"],
+        Some(Text) => vec!["What does this text say?", "What is this file for?"],
         Some(Unknown) => vec!["What kind of file is this?", "Is there any readable text inside?"],
     }
 }
@@ -458,7 +459,7 @@ fn item_ui(ui: &mut Ui, item: &ChatItem, beginner: bool, dense: bool, open: bool
                 egui::Frame::new().fill(t.raised).corner_radius(t.r_sm()).inner_margin(Margin::symmetric(10, 3)).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         icons::show(ui, icon, 13.0, col);
-                        ui.label(RichText::new(tool.replace('_', " ")).font(theme::mono(12.5)).color(t.text_dim));
+                        ui.label(RichText::new(tool.replace('_', " ")).font(theme::mono(theme::CAPTION)).color(t.text_dim));
                     });
                 });
                 if !summary.is_empty() {
@@ -702,7 +703,7 @@ fn paragraph(ui: &mut Ui, text: &str, bullet: bool, with_glossary: bool, body: &
 fn code_block(ui: &mut Ui, code: &str, t: &Tokens) {
     egui::Frame::new().fill(t.code_bg).corner_radius(t.r()).inner_margin(Margin::same(10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.add(egui::Label::new(RichText::new(code.trim_end()).font(theme::mono(12.5)).color(t.text)).wrap());
+        ui.add(egui::Label::new(RichText::new(code.trim_end()).font(theme::mono(theme::CAPTION)).color(t.text)).wrap());
     });
 }
 
@@ -763,7 +764,7 @@ mod tests {
 
     #[test]
     fn every_kind_has_suggestions() {
-        for k in [TargetKind::Elf, TargetKind::Apk, TargetKind::Asar, TargetKind::Unknown, TargetKind::Directory] {
+        for k in [TargetKind::Elf, TargetKind::Apk, TargetKind::Asar, TargetKind::Text, TargetKind::Unknown, TargetKind::Directory] {
             assert!(suggestions(Some(k)).len() >= 2);
         }
         assert!(!suggestions(None).is_empty());

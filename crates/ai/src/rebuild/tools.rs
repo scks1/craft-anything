@@ -7,6 +7,7 @@ use super::*;
 use craft_anything_engine::EngineRef;
 use craft_anything_engine::questions::{self, AskedQuestion};
 use craft_anything_engine::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
+use craft_anything_engine::workspace::ProjectUsage;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -118,9 +119,11 @@ pub fn specs() -> Vec<ToolSpec> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StartParams {
-    /// What to make (a new project), or the follow-up message (with `project`).
+    /// What to make (a new project), or the follow-up message (with `project`, or a
+    /// `project_folder` that already holds one).
     pub request: String,
     /// For a new project: a web address, an absolute path to an app, game or file, or `-` for none.
+    /// A `project_folder` that already holds one keeps its saved target.
     #[serde(default)]
     pub target: Option<String>,
     /// Continue this project folder instead of starting a new one.
@@ -134,11 +137,13 @@ pub struct StartParams {
     #[serde(default)]
     pub projects_dir: Option<PathBuf>,
     /// Start the new project in this folder itself instead (it's added to the project list). If
-    /// it already has files, `existing` says what they are.
+    /// it already has files, `existing` says what they are; if it already holds a project, its
+    /// saved target, settings and stack are kept and `request` becomes its follow-up.
     #[serde(default)]
     pub project_folder: Option<PathBuf>,
-    /// With `project_folder` that has files: `edit` (they're the app, edited in place) or
-    /// `start_from` (material to start from; the app is built in app/ beside them).
+    /// With `project_folder` that has files and isn't a project yet: `edit` (they're the app,
+    /// edited in place) or `start_from` (material to start from; the app is built in app/ beside
+    /// them).
     #[serde(default)]
     pub existing: Option<craft_anything_engine::workspace::ExistingFiles>,
     /// What to build with: an engine (unity, unreal, godot, rust) or a stack's full name.
@@ -168,14 +173,16 @@ pub struct CheckParams {
     /// The project's folder; default: the project this tool server was started for.
     #[serde(default)]
     pub project: Option<PathBuf>,
-    /// Longest wait for the result, in minutes (1..=60, default 20): a website with several pages
-    /// or a game's engine build takes a few minutes.
+    /// Longest wait for the result, in minutes (1..=60, default 35): a website with several pages
+    /// or a game's engine build takes a few minutes, and the run stops a check at 30.
     #[serde(default = "d_wait_minutes")]
     pub wait_minutes: u64,
 }
 
+/// Longer than the run's own limit on the check ([`self_check::SELF_CHECK_LIMIT`]), so a check
+/// that hangs is stopped and reported by the run before the builder stops waiting for it.
 fn d_wait_minutes() -> u64 {
-    20
+    self_check::SELF_CHECK_LIMIT.as_secs() / 60 + 5
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -287,10 +294,19 @@ fn rebuild_question_ask(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         deep: settings.deep_mode,
         ..AskedQuestion::new(question.to_string(), answered.answer.clone(), from_session, answered.backend.clone(), answered.cost_usd, after)
     };
+    record_question_usage(&ws, &answered);
     // The replacement notice is for this caller; the saved question keeps the AI that answered.
     // An answer that couldn't be kept is still the answer.
     let not_kept = questions::add(&ws, asked).err().map(|e| e.message);
     Ok(ToolOutput::Value(json!({"project": ws.root, "question": question, "answered": answered, "not_kept": not_kept})))
+}
+
+/// Add a question's reported cost to the project's usage, as a build turn's cost is added.
+fn record_question_usage(ws: &Workspace, answered: &super::question::Answered) {
+    let Some(cost) = answered.cost_usd.filter(|cost| cost.is_finite() && *cost > 0.0) else { return };
+    if let Err(e) = ProjectUsage::update(&ws.root, |u| u.add_turn(0, 0, Some(cost), answered.cost_is_estimate)) {
+        log::warn!("Couldn't record the question's cost in {}: {}", ws.root.display(), e.message);
+    }
 }
 
 fn rebuild_questions_list(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
@@ -299,6 +315,7 @@ fn rebuild_questions_list(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
     Ok(ToolOutput::Value(json!({"count": questions.len(), "questions": questions})))
 }
 
+/// Start a build: a new project, or a follow-up on an existing one, through the run queue.
 fn rebuild_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: StartParams = parse_params(params)?;
     let engine = engine(ctx).ok_or_else(|| {
@@ -325,6 +342,20 @@ fn rebuild_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
         }
         None if p.resume => return Err(ToolError::invalid("resume is for an existing project.").with_remediation("Pass its folder as `project`.")),
         None => {
+            let attached = p.project_folder.as_deref().is_some_and(project::has_project);
+            if attached {
+                if p.existing.is_some() {
+                    return Err(ToolError::invalid("This folder already holds a project; pass it as `project` to continue it."));
+                }
+                if p.build_with.is_some() {
+                    return Err(ToolError::invalid("build_with is for new projects; a project keeps the stack it was built with."));
+                }
+                if p.generate_assets {
+                    return Err(
+                        ToolError::invalid("generate_assets is for new projects.").with_remediation("Use project_assets_allow for an existing project.")
+                    );
+                }
+            }
             let target = p.target.as_deref().unwrap_or("-");
             let place = match (&p.project_folder, &p.projects_dir) {
                 (Some(_), Some(_)) => return Err(ToolError::invalid("Pass projects_dir or project_folder, not both.")),
@@ -336,7 +367,7 @@ fn rebuild_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
             if p.project_folder.is_some() || matches!(place, project::Place::At(..)) {
                 ctx.session.remember_project(&ws.root)?;
             }
-            (ws, None)
+            (ws, project::attached_request(attached, &p.request))
         }
     };
     if !p.pictures.is_empty() {
@@ -474,11 +505,29 @@ fn rebuild_check(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     let id = asks.post(craft_anything_engine::inbox::RequestKind::Question, "Check the build", "", Vec::new(), false, None)?;
     ctx.report(None, "Checking the build against the original…");
     let cancel = ctx.cancel.clone();
-    match asks.wait(&id, Duration::from_secs(p.wait_minutes * 60), &|| cancel.is_cancelled()) {
+    let answer = asks.wait(&id, Duration::from_secs(p.wait_minutes.saturating_mul(60)), &|| cancel.is_cancelled());
+    // The run marks a request it has taken: without the mark, no run took it.
+    let mark = self_check::taken_mark(&ws.root, &id);
+    let taken = mark.as_ref().is_some_and(|m| m.is_file());
+    if let Some(mark) = &mark {
+        let _ = std::fs::remove_file(mark);
+    }
+    match answer {
         Some(a) => Ok(ToolOutput::Value(json!({"project": ws.root.display().to_string(), "report": a.text.unwrap_or_default()}))),
         None if ctx.cancel.is_cancelled() => Err(ToolError::new(ErrorCode::Cancelled, "Stopped.")),
-        None => Err(ToolError::new(ErrorCode::NotFound, "No answer: no build is running for this project, or the check took too long.")
-            .with_remediation("Use this while Craft Anything is building the project; otherwise build it and finish the turn, and it is checked after.")),
+        None => Err(unanswered(taken, p.wait_minutes)),
+    }
+}
+
+/// Why `rebuild_check` got no report: a run took the check and it is still going (a step may be
+/// stuck), or no run took it at all.
+fn unanswered(taken: bool, minutes: u64) -> ToolError {
+    if taken {
+        ToolError::new(ErrorCode::TimedOut, format!("The running build took the check, but it hadn't finished after {minutes} minutes."))
+            .with_remediation("A step of the check may be stuck (the project's feed says which step it's on). Don't ask again: finish the turn, and the build is checked after it, with a time limit.")
+    } else {
+        ToolError::new(ErrorCode::NotFound, format!("No build is running for this project: nothing took the check in {minutes} minutes."))
+            .with_remediation("Use this while Craft Anything is building the project; otherwise build it and finish the turn, and it is checked after.")
     }
 }
 
@@ -486,6 +535,29 @@ fn rebuild_check(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
 mod tests {
     use super::*;
     use craft_anything_engine::{CallOptions, Caller, Consent, Engine};
+
+    #[test]
+    fn a_questions_cost_is_counted_in_the_projects_usage() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        let answered = |cost, estimate| super::super::question::Answered {
+            answer: "It is a notes app.".into(),
+            from: super::super::question::AnsweredFrom::BuildersSession,
+            backend: "Claude".into(),
+            cost_usd: cost,
+            cost_is_estimate: estimate,
+            builder_notice: None,
+        };
+        record_question_usage(&ws, &answered(Some(0.02), true));
+        let u = ws.usage();
+        assert!((u.cost_usd - 0.02).abs() < 1e-9 && u.api_billed_usd == 0.0 && u.priced, "an agent's estimate: {u:?}");
+        record_question_usage(&ws, &answered(Some(0.03), false));
+        let u = ws.usage();
+        assert!((u.cost_usd - 0.05).abs() < 1e-9 && (u.api_billed_usd - 0.03).abs() < 1e-9, "a key's charge: {u:?}");
+        record_question_usage(&ws, &answered(None, true));
+        record_question_usage(&ws, &answered(Some(0.0), true));
+        assert!((ws.usage().cost_usd - 0.05).abs() < 1e-9, "no cost is no change");
+    }
 
     #[test]
     fn a_question_through_the_engine_comes_back_instead_of_waiting_for_the_session() {
@@ -537,6 +609,82 @@ mod tests {
         assert!(e.call("rebuild_note", json!({"project": ws.root, "text": "blue"}), ok()).is_err());
         assert!(e.call("rebuild_note_withdraw", json!({"project": ws.root, "id": 1}), ok()).is_err());
         assert!(e.call("rebuild_stop", json!({"project": ws.root}), ok()).is_err());
+    }
+
+    /// An existing project is attached, not treated as new: its saved settings stay,
+    /// new-project-only options are refused, and the request becomes a follow-up.
+    #[test]
+    fn starting_at_a_folder_that_already_holds_a_project_attaches() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::shared(craft_anything_engine::testing::session(), specs());
+        let ok = || CallOptions::new(Caller::Cli).with_consent(Consent::Granted);
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        ws.set_person(|m| {
+            m.builder = Some("Claude".into());
+            m.asset_budget_usd = 42.0;
+            m.generate_assets = true;
+        })
+        .unwrap();
+        for (p, said) in [
+            (json!({"project_folder": ws.root, "request": "change it", "build_with": "unity"}), "build_with is for new projects"),
+            (json!({"project_folder": ws.root, "request": "change it", "generate_assets": true}), "generate_assets is for new projects"),
+            (json!({"project_folder": ws.root, "request": "change it", "existing": "edit"}), "already holds a project"),
+        ] {
+            let err = e.call("rebuild_start", p, ok()).unwrap_err();
+            assert!(err.message.contains(said), "{err:?}");
+        }
+        let saved = Workspace::open(&ws.root).unwrap().manifest;
+        assert_eq!(saved.builder.as_deref(), Some("Claude"));
+        assert_eq!(saved.asset_budget_usd, 42.0);
+        assert!(saved.generate_assets);
+    }
+
+    /// The success path: an attached folder keeps its manifest settings, and its typed request
+    /// lands in the run's feed as the follow-up.
+    #[test]
+    fn starting_at_an_existing_project_sends_its_request_as_a_follow_up() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = craft_anything_engine::testing::session();
+        let mut ai = crate::AiConfig::default();
+        ai.upsert(crate::BackendEntry {
+            config: crate::BackendConfig {
+                name: "Local".into(),
+                kind: crate::BackendKind::OpenaiCompatible,
+                model: "qwen3:8b".into(),
+                // Nothing listens there: the run only has to start and write its feed.
+                base_url: Some("http://127.0.0.1:0/v1".into()),
+                ssh_host: None,
+                enabled: true,
+            },
+            options: Default::default(),
+        });
+        s.settings.ai = ai.to_table().unwrap();
+        s.settings.save_to(&s.config_dir().join("config.toml")).unwrap();
+        let e = Engine::shared(s, specs());
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        ws.set_person(|m| {
+            m.builder = Some("Claude".into());
+            m.asset_budget_usd = 42.0;
+            m.generate_assets = true;
+        })
+        .unwrap();
+        ws.manifest.stack = "Godot".into();
+        ws.save().unwrap();
+        let ok = || CallOptions::new(Caller::Mcp).with_consent(Consent::Granted);
+        let out =
+            e.call("rebuild_start", json!({"project_folder": ws.root, "request": "add a jump", "rounds": 0, "backend": "Local"}), ok()).unwrap().to_json();
+        assert_eq!(out["result"]["started"].as_bool(), Some(true), "{out}");
+        let saved = Workspace::open(&ws.root).unwrap().manifest;
+        assert_eq!(saved.builder.as_deref(), Some("Claude"), "the saved builder is kept");
+        assert_eq!(saved.asset_budget_usd, 42.0, "the saved budget is kept");
+        assert!(saved.generate_assets, "the saved asset setting is kept");
+        assert_eq!(saved.stack, "Godot", "the saved stack is kept");
+        let feed = craft_anything_engine::feed::load(&ws);
+        assert!(
+            feed.iter().any(|i| matches!(i, craft_anything_engine::feed::FeedItem::User(u) if u.text() == "add a jump")),
+            "the request is the run's follow-up: {feed:?}"
+        );
+        let _ = e.call("rebuild_stop", json!({"project": ws.root}), ok());
     }
 
     #[test]
@@ -669,5 +817,23 @@ mod tests {
         let _here = self_check::BuildingHere::new(&ws.root);
         let err = e.call("rebuild_check", json!({"project": ws.root}), ok()).err().unwrap();
         assert_eq!(err.code, ErrorCode::FeatureMissing);
+    }
+
+    /// A check the run took but didn't finish isn't reported as "no build is running", and the
+    /// builder waits longer than the run's own limit on a check, so the run reports a stuck one.
+    #[test]
+    fn a_check_still_going_is_told_apart_from_no_build() {
+        assert!(Duration::from_secs(d_wait_minutes() * 60) > self_check::SELF_CHECK_LIMIT);
+        let root = Path::new("project");
+        assert!(self_check::taken_mark(root, "1762700000000-42-1").is_some_and(|m| m.starts_with(self_check::asks_dir(root))));
+        for bad in ["", "../../x", "..\\x", "c:x", "a/b"] {
+            assert!(self_check::taken_mark(root, bad).is_none(), "{bad:?} would put the mark outside checks/asks/");
+        }
+        let going = unanswered(true, 35);
+        assert_eq!(going.code, ErrorCode::TimedOut);
+        assert!(going.message.contains("took the check") && !going.message.contains("No build is running"), "{}", going.message);
+        let none = unanswered(false, 35);
+        assert_eq!(none.code, ErrorCode::NotFound);
+        assert!(none.message.contains("No build is running") && none.message.contains("35 minutes"), "{}", none.message);
     }
 }

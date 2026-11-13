@@ -53,7 +53,8 @@ fn run_idle_builder(create_app_dir: bool) -> (ToolError, Vec<Vec<Msg>>) {
     let seen = Arc::default();
     let turns = (0..20).map(|_| turn(vec![Block::Text { text: "Built it and ran npm run build.".into() }], StopReason::EndTurn)).collect();
     let model = Scripted { turns, seen: Arc::clone(&seen) };
-    let slot = ModelSlot { name: "Scripted".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0 };
+    let slot =
+        ModelSlot { name: "Scripted".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0, tools: Default::default() };
     let api = ApiConversation::start(Arc::new(EngineHost(worker.engine.clone())), vec![slot], LoopConfig::default()).unwrap();
     let entry = crate::BackendEntry {
         config: crate::BackendConfig {
@@ -69,7 +70,7 @@ fn run_idle_builder(create_app_dir: bool) -> (ToolError, Vec<Vec<Msg>>) {
     let mut kinds = KindRegistry::built_in();
     kinds.register(Arc::new(NeverBuilt));
     let opts = RunOptions { message: Some("Build the app".into()), kinds, max_rounds: 6, ..RunOptions::default() };
-    let error = worker.run(&mut ws, entry, Some(api), None, &opts).unwrap_err();
+    let error = worker.run(&mut ws, entry, Some(api), None, super::super::KeptHistory::default(), &opts).unwrap_err();
     let requests = seen.lock().unwrap().clone();
     (error, requests)
 }
@@ -127,7 +128,8 @@ impl ChatModel for Busy {
 fn run_busy_builder(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Option<&str>) -> ToolError {
     let mut worker = check_worker(ws, false);
     let model = Busy { app: ws.app_dir(), turn: 0, seen: Arc::clone(seen) };
-    let slot = ModelSlot { name: "Busy".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0 };
+    let slot =
+        ModelSlot { name: "Busy".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0, tools: Default::default() };
     let api = ApiConversation::start(Arc::new(EngineHost(worker.engine.clone())), vec![slot], LoopConfig::default()).unwrap();
     let entry = crate::BackendEntry {
         config: crate::BackendConfig {
@@ -143,7 +145,7 @@ fn run_busy_builder(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Optio
     let mut kinds = KindRegistry::built_in();
     kinds.register(Arc::new(NeverBuilt));
     let opts = RunOptions { message: message.map(str::to_string), continuing: message.is_none(), kinds, max_rounds: 6, ..RunOptions::default() };
-    worker.run(ws, entry, Some(api), None, &opts).unwrap_err()
+    worker.run(ws, entry, Some(api), None, super::super::KeptHistory::default(), &opts).unwrap_err()
 }
 
 #[test]

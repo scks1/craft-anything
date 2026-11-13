@@ -97,20 +97,23 @@ fn slot_name(s: u32) -> String {
     }
 }
 
+/// Code-directory flag bits, named as `codesign -d` names them.
 const CD_FLAGS: &[(u32, &str)] = &[
     (0x1, "host"),
     (0x2, "adhoc"),
-    (0x4, "force-hard"),
-    (0x8, "force-kill"),
-    (0x10, "force-expiration"),
-    (0x20, "restrict"),
-    (0x40, "enforcement"),
-    (0x80, "library-validation"),
-    (0x200, "allowed-entitlements"),
-    (0x800, "installer"),
+    (0x100, "hard"),
+    (0x200, "kill"),
+    (0x400, "expires"),
+    (0x800, "restrict"),
+    (0x1000, "enforcement"),
+    (0x2000, "library-validation"),
     (0x1_0000, "runtime"),
     (0x2_0000, "linker-signed"),
 ];
+
+fn cd_flag_names(flags: u32) -> Vec<&'static str> {
+    CD_FLAGS.iter().filter(|(bit, _)| flags & bit != 0).map(|(_, name)| *name).collect()
+}
 
 fn hash_name(t: u8) -> &'static str {
     match t {
@@ -311,7 +314,7 @@ fn code_directory(b: &[u8], slot: u32, offset: usize) -> Result<CodeDirectory, F
         length,
         version: format!("{version:#x}"),
         flags,
-        flag_names: CD_FLAGS.iter().filter(|(bit, _)| flags & bit != 0).map(|(_, n)| *n).collect(),
+        flag_names: cd_flag_names(flags),
         identifier: ident,
         team_id,
         hash_type: hash_name(hash_type).into(),
@@ -499,14 +502,21 @@ fn unquote(s: &str) -> String {
     s.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(s).to_string()
 }
 
-/// A DER object identifier as dotted text.
+/// A DER object identifier as dotted text, or `invalid` when it is empty, a subidentifier is
+/// padded with a leading 0x80 octet, the last one never ends (X.690 8.19.2) or there are more
+/// than 64 arcs, rather than a different, shorter OID.
 pub fn oid_text(d: &[u8]) -> String {
     let mut parts: Vec<u64> = Vec::new();
     let mut v = 0u64;
-    for (i, &b) in d.iter().enumerate() {
-        v = v.checked_shl(7).map(|x| x | u64::from(b & 0x7f)).unwrap_or(u64::MAX);
+    let mut arc_start = true;
+    for &b in d {
+        if arc_start && b == 0x80 {
+            return "invalid".into();
+        }
+        arc_start = b & 0x80 == 0;
+        v = v.checked_mul(128).and_then(|x| x.checked_add(u64::from(b & 0x7f))).unwrap_or(u64::MAX);
         if b & 0x80 == 0 {
-            if parts.is_empty() && i < 8 {
+            if parts.is_empty() {
                 let first = if v < 80 { v / 40 } else { 2 };
                 parts.push(first);
                 parts.push(v - first * 40);
@@ -516,8 +526,11 @@ pub fn oid_text(d: &[u8]) -> String {
             v = 0;
         }
         if parts.len() > 64 {
-            break;
+            return "invalid".into();
         }
+    }
+    if !arc_start || parts.is_empty() {
+        return "invalid".into();
     }
     parts.iter().map(u64::to_string).collect::<Vec<_>>().join(".")
 }
@@ -528,10 +541,64 @@ mod tests {
     use craft_anything_testkit::apple as fx;
 
     #[test]
+    fn oid_text_saturates_oversized_arc() {
+        let d = [0x2a, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+        assert_eq!(oid_text(&d), "1.2.18446744073709551615");
+    }
+
+    #[test]
+    fn oid_text_refuses_malformed_subidentifiers() {
+        // 1.2.840.113635.100.6.1.13, as a Developer ID requirement names a certificate field.
+        let field = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x06, 0x01, 0x0d];
+        assert_eq!(oid_text(&field), "1.2.840.113635.100.6.1.13");
+        // The last subidentifier never ends: not the shorter OID 1.2.840.113635.100.6.1.
+        let mut unterminated = field;
+        unterminated[9] = 0x8d;
+        assert_eq!(oid_text(&unterminated), "invalid");
+        // A subidentifier padded with a leading 0x80 octet, first and later in the value.
+        assert_eq!(oid_text(&[0x80, 0x2a]), "invalid");
+        assert_eq!(oid_text(&[0x2a, 0x80, 0x86, 0x48]), "invalid");
+        assert_eq!(oid_text(&[]), "invalid");
+        // 64 arcs are shown; a 65th is refused.
+        let mut arcs = vec![0x2a];
+        arcs.extend([0x01; 62]);
+        assert_eq!(oid_text(&arcs).split('.').count(), 64);
+        arcs.push(0x01);
+        assert_eq!(oid_text(&arcs), "invalid");
+        // 0x80 inside a subidentifier is an ordinary zero group.
+        assert_eq!(oid_text(&[0x2a, 0x86, 0x80, 0x00]), "1.2.98304");
+    }
+
+    #[test]
+    fn oid_text_splits_a_long_first_subidentifier() {
+        // 2.72057594037927936.1: the first subidentifier takes nine octets.
+        let d = [0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x50, 0x01];
+        assert_eq!(oid_text(&d), "2.72057594037927936.1");
+    }
+
+    #[test]
     fn sha1_vectors() {
         assert_eq!(hex(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
         assert_eq!(oid_text(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x06, 0x02, 0x06]), "1.2.840.113635.100.6.2.6");
+    }
+
+    /// Flag names match `codesign -d`, for example `flags=0x12200(kill,library-validation,runtime)`.
+    #[test]
+    fn code_directory_flags_are_named_as_codesign_names_them() {
+        assert_eq!(cd_flag_names(0x1_2200), ["kill", "library-validation", "runtime"]);
+        assert_eq!(cd_flag_names(0x1_2702), ["adhoc", "hard", "kill", "expires", "library-validation", "runtime"]);
+        assert_eq!(cd_flag_names(0x1_3300), ["hard", "kill", "enforcement", "library-validation", "runtime"]);
+        assert_eq!(cd_flag_names(0x3), ["host", "adhoc"]);
+        assert_eq!(cd_flag_names(0x800), ["restrict"]);
+        assert_eq!(cd_flag_names(0x2_0002), ["adhoc", "linker-signed"]);
+        assert!(cd_flag_names(0xfc).is_empty(), "bits 0x4 to 0x80 are not code-directory flags");
+
+        // A parsed signature carries the same names.
+        let mut blob = fx::code_signature_blob();
+        let cd = blob.windows(4).position(|w| w == [0xfa, 0xde, 0x0c, 0x02]).expect("a code directory");
+        blob[cd + 12..cd + 16].copy_from_slice(&0x2000u32.to_be_bytes());
+        assert_eq!(parse(&blob).unwrap().code_directories[0].flag_names, ["library-validation"]);
     }
 
     #[test]

@@ -20,6 +20,8 @@ const XML_RESOURCE_MAP: u16 = 0x0180;
 const MAX_STRINGS: usize = 1_000_000;
 /// Longest string kept (characters).
 const MAX_STRING: usize = 64 * 1024;
+/// Base budget for decoded string bytes; larger chunks allow at most three times their size.
+const BASE_POOL_BYTES: usize = 64 << 20;
 /// Most extra UTF-8 length candidates examined across one string pool.
 const MAX_RECOVERY_PROBES: usize = 65_536;
 /// Most XML nodes decoded.
@@ -57,7 +59,7 @@ impl StringPool {
         self.strings.get(i as usize).map(String::as_str)
     }
 
-    /// Parse the pool whose chunk starts at `off`.
+    /// Parse the pool whose chunk starts at `off`, retaining a prefix within the string and byte budgets.
     pub fn parse(data: &[u8], off: usize) -> Result<StringPool, FormatError> {
         let mut recovery_left = MAX_RECOVERY_PROBES;
         Self::parse_with_recovery_budget(data, off, &mut recovery_left)
@@ -94,6 +96,7 @@ impl StringPool {
         let string_bytes = r.slice(strings_start, end - strings_start).ok_or_else(|| FormatError::Truncated("string data".into()))?;
         let strings_reader = Reader::new(string_bytes);
         let mut strings = Vec::with_capacity(count.min(MAX_STRINGS).min(65_536));
+        let mut bytes_left = BASE_POOL_BYTES.max(size.saturating_mul(3));
         for i in 0..count.min(MAX_STRINGS) {
             let at = r.u32_le(hdr + i * 4).ok_or_else(|| FormatError::Truncated("string offsets".into()))? as usize;
             let s = if at >= string_bytes.len() {
@@ -103,7 +106,12 @@ impl StringPool {
             } else {
                 utf16_string(&strings_reader, at, string_bytes.len())
             };
-            strings.push(s.unwrap_or_default());
+            let s = s.unwrap_or_default();
+            if s.len() > bytes_left {
+                break;
+            }
+            bytes_left -= s.len();
+            strings.push(s);
         }
         Ok(StringPool { strings, utf8, declared: count })
     }
@@ -303,6 +311,8 @@ pub fn parse(data: &[u8]) -> Result<Document, FormatError> {
     if t != RES_XML {
         return Err(FormatError::Malformed(format!("not binary XML (chunk type {t:#x})")));
     }
+    let data = r.slice(0, size).ok_or_else(|| FormatError::Truncated("binary XML document".into()))?;
+    let r = Reader::new(data);
     let mut doc = Document::default();
     let mut res_map: Vec<u32> = Vec::new();
     let mut pos = h;
@@ -310,12 +320,30 @@ pub fn parse(data: &[u8]) -> Result<Document, FormatError> {
     let mut ns_stack: Vec<(String, String)> = Vec::new();
     while pos < size {
         let Some((ct, ch, cs)) = chunk(&r, pos) else {
+            doc.truncated = true;
             doc.warnings.push(format!("unreadable chunk at offset {pos}"));
             break;
         };
+        let extension = match ct {
+            XML_START_NS | XML_END_NS | XML_END_ELEMENT => 8,
+            XML_START_ELEMENT => 20,
+            XML_CDATA => 12,
+            _ => 0,
+        };
+        if extension != 0 && (ch < 16 || cs - ch < extension) {
+            doc.truncated = true;
+            doc.warnings.push(format!("incomplete XML node at offset {pos}"));
+            break;
+        }
         match ct {
             RES_STRING_POOL => match StringPool::parse(data, pos) {
-                Ok(p) => doc.pool = p,
+                Ok(p) => {
+                    if p.strings.len() < p.declared {
+                        doc.truncated = true;
+                        doc.warnings.push(format!("string pool was capped at {} of {} strings", p.strings.len(), p.declared));
+                    }
+                    doc.pool = p;
+                }
                 Err(e) => doc.warnings.push(format!("string pool: {e}")),
             },
             XML_RESOURCE_MAP => {
@@ -324,8 +352,8 @@ pub fn parse(data: &[u8]) -> Result<Document, FormatError> {
                 doc.resource_ids = res_map.len();
             }
             XML_START_NS | XML_END_NS => {
-                let prefix = r.u32_le(pos + 16).and_then(|i| doc.pool.get(i)).unwrap_or("").to_string();
-                let uri = r.u32_le(pos + 20).and_then(|i| doc.pool.get(i)).unwrap_or("").to_string();
+                let prefix = r.u32_le(pos + ch).and_then(|i| doc.pool.get(i)).unwrap_or("").to_string();
+                let uri = r.u32_le(pos + ch + 4).and_then(|i| doc.pool.get(i)).unwrap_or("").to_string();
                 if ct == XML_START_NS {
                     if doc.namespaces.len() < 256 {
                         doc.namespaces.push((prefix.clone(), uri.clone()));
@@ -350,13 +378,26 @@ pub fn parse(data: &[u8]) -> Result<Document, FormatError> {
                 let ns = r.u32_le(ext).and_then(|i| doc.pool.get(i)).map(str::to_string);
                 let name = r.u32_le(ext + 4).and_then(|i| doc.pool.get(i)).unwrap_or("?").to_string();
                 let a_start = usize::from(r.u16_le(ext + 8).unwrap_or(20));
-                let a_size = usize::from(r.u16_le(ext + 10).unwrap_or(20)).max(20);
+                let a_size = usize::from(r.u16_le(ext + 10).unwrap_or(20));
                 let a_count = usize::from(r.u16_le(ext + 12).unwrap_or(0));
+                if a_count != 0 && (a_start < 20 || a_size < 20) {
+                    doc.truncated = true;
+                    doc.warnings.push(format!("element {name}: invalid attribute table layout"));
+                    break;
+                }
                 let mut attributes = Vec::new();
                 for i in 0..a_count {
-                    let Some(a) = ext.checked_add(a_start).and_then(|x| x.checked_add(i * a_size)) else { break };
-                    if a + 20 > pos + cs {
+                    let relative = a_start + i * a_size;
+                    if relative.checked_add(a_size).is_none_or(|end| end > cs - ch) {
+                        doc.truncated = true;
                         doc.warnings.push(format!("element {name}: attribute {i} runs past its chunk"));
+                        break;
+                    }
+                    let a = ext + relative;
+                    let value_size = usize::from(r.u16_le(a + 12).unwrap_or(0));
+                    if value_size < 8 || value_size > a_size - 12 {
+                        doc.truncated = true;
+                        doc.warnings.push(format!("element {name}: invalid typed value size in attribute {i}"));
                         break;
                     }
                     let ans = r.u32_le(a).and_then(|i| doc.pool.get(i)).map(str::to_string);
@@ -724,6 +765,82 @@ mod tests {
         offset
     }
 
+    fn shared_ascii_pool(utf8: bool, count: usize) -> Vec<u8> {
+        let len = 16_384usize;
+        let mut strings = Vec::new();
+        if utf8 {
+            append_legacy_ascii(&mut strings, len);
+        } else {
+            strings.extend_from_slice(&(len as u16).to_le_bytes());
+            for _ in 0..len {
+                strings.extend_from_slice(b"x\0");
+            }
+            strings.extend_from_slice(&[0, 0]);
+        }
+        let mut data = pool_with_offsets(&vec![0; count], &strings);
+        if !utf8 {
+            data[16..20].fill(0);
+        }
+        data
+    }
+
+    #[test]
+    fn shared_offsets_spend_a_pool_byte_budget() {
+        for utf8 in [true, false] {
+            let mut data = shared_ascii_pool(utf8, 8192);
+            for appended in [false, true] {
+                if appended {
+                    // Unrelated bytes after the chunk cannot buy more retained copies.
+                    data.resize(24 << 20, 0);
+                }
+                let pool = StringPool::parse(&data, 0).unwrap();
+                assert_eq!(pool.declared, 8192);
+                assert_eq!(pool.strings.len(), 4096);
+                assert_eq!(pool.strings.iter().map(String::len).sum::<usize>(), 64 << 20);
+                assert_eq!(pool.get(4095).map(str::len), Some(16_384));
+                assert_eq!(pool.get(4096), None);
+            }
+            let data = shared_ascii_pool(utf8, 2);
+            let pool = StringPool::parse(&data, 0).unwrap();
+            assert_eq!(pool.strings.len(), 2);
+            assert_eq!(pool.get(0), pool.get(1));
+        }
+    }
+
+    fn pool_container(kind: u16, header: usize, children: &[u8]) -> Vec<u8> {
+        let mut data = vec![0; header];
+        data[0..2].copy_from_slice(&kind.to_le_bytes());
+        data[2..4].copy_from_slice(&(header as u16).to_le_bytes());
+        data.extend_from_slice(children);
+        let len = data.len() as u32;
+        data[4..8].copy_from_slice(&len.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn xml_and_resource_tables_disclose_partial_string_pools() {
+        let pool = shared_ascii_pool(true, 8192);
+        {
+            let doc = parse(&pool_container(RES_XML, 8, &pool)).unwrap();
+            assert!(doc.truncated);
+            assert!(doc.warnings.iter().any(|w| w.contains("string pool") && w.contains("4096 of 8192")));
+            assert_eq!(doc.pool.strings.len(), 4096);
+        }
+        let table = crate::arsc::parse(&pool_container(2, 12, &pool), crate::arsc::Limits::default()).unwrap();
+        assert!(table.truncated);
+        assert_eq!(table.global_strings, 8192);
+        assert!(table.warnings.iter().any(|w| w.contains("global string pool") && w.contains("4096 of 8192")));
+        for (field, label) in [(268, "type"), (276, "key")] {
+            let mut package = pool_container(0x0200, 288, &pool);
+            package[8..12].copy_from_slice(&0x7fu32.to_le_bytes());
+            package[field..field + 4].copy_from_slice(&288u32.to_le_bytes());
+            let table = crate::arsc::parse(&pool_container(2, 12, &package), crate::arsc::Limits::default()).unwrap();
+            assert!(table.truncated, "{label}");
+            assert!(table.warnings.iter().any(|w| w.contains(&format!("{label} string pool")) && w.contains("4096 of 8192")));
+            assert_eq!(table.packages.len(), 1);
+        }
+    }
+
     #[test]
     fn repeated_offsets_share_the_utf8_recovery_budget() {
         let mut strings = Vec::new();
@@ -802,6 +919,89 @@ mod tests {
         assert!(parsed.strings[..repeated].iter().all(String::is_empty));
         assert_eq!(parsed.get(repeated as u32), Some(""));
         assert_eq!(parsed.get((repeated + 1) as u32), Some("ok"));
+    }
+
+    fn chunk_at(data: &[u8], kind: u16) -> usize {
+        let r = Reader::new(data);
+        let mut pos = 8;
+        loop {
+            let (t, _, n) = chunk(&r, pos).unwrap();
+            if t == kind {
+                return pos;
+            }
+            pos += n;
+        }
+    }
+
+    #[test]
+    fn nodes_cannot_borrow_from_a_sibling_or_from_after_the_document() {
+        let original = fx::manifest_axml();
+        let pos = chunk_at(&original, XML_START_ELEMENT);
+        for (header, size) in [(8u16, 36u32), (16, 35)] {
+            let mut data = original.clone();
+            data[pos + 2..pos + 4].copy_from_slice(&header.to_le_bytes());
+            data[pos + 4..pos + 8].copy_from_slice(&size.to_le_bytes());
+            let doc = parse(&data).unwrap();
+            assert!(doc.truncated);
+            assert!(manifest(&doc).package.is_none());
+        }
+        let mut data = original;
+        data[4..8].copy_from_slice(&((pos + 8) as u32).to_le_bytes());
+        let doc = parse(&data).unwrap();
+        assert!(doc.truncated);
+        assert!(manifest(&doc).package.is_none());
+    }
+
+    #[test]
+    fn namespace_extensions_follow_the_declared_header() {
+        let mut data = fx::manifest_axml();
+        let pos = chunk_at(&data, XML_START_NS);
+        data.splice(pos + 16..pos + 16, [0xff; 4]);
+        data[pos + 2..pos + 4].copy_from_slice(&20u16.to_le_bytes());
+        data[pos + 4..pos + 8].copy_from_slice(&28u32.to_le_bytes());
+        let len = data.len() as u32;
+        data[4..8].copy_from_slice(&len.to_le_bytes());
+        let doc = parse(&data).unwrap();
+        assert!(doc.warnings.is_empty());
+        assert_eq!(doc.namespaces[0], ("android".into(), ANDROID_NS.into()));
+    }
+
+    #[test]
+    fn attributes_need_their_own_complete_records_and_typed_values() {
+        let original = fx::manifest_axml();
+        let ext = chunk_at(&original, XML_START_ELEMENT) + 16;
+        for (offset, val) in [(8, 0u16), (10, 4), (10, u16::MAX), (32, 7), (32, 9)] {
+            let mut data = original.clone();
+            data[ext + offset..ext + offset + 2].copy_from_slice(&val.to_le_bytes());
+            let doc = parse(&data).unwrap();
+            assert!(doc.truncated, "field {offset}, value {val}");
+            assert!(manifest(&doc).package.is_none());
+        }
+    }
+
+    #[test]
+    fn extended_attribute_strides_keep_each_manifest_value() {
+        let mut data = fx::manifest_axml();
+        let pos = chunk_at(&data, XML_START_ELEMENT);
+        let ext = pos + 16;
+        // The fixture writes three 20-byte attributes with 8-byte typed values.
+        for index in (1..=3).rev() {
+            let end = ext + 20 + index * 20;
+            data.splice(end..end, [0xff; 4]);
+        }
+        data[ext + 10..ext + 12].copy_from_slice(&24u16.to_le_bytes());
+        data[pos + 4..pos + 8].copy_from_slice(&(36 + 3 * 24u32).to_le_bytes());
+        let len = data.len() as u32;
+        data[4..8].copy_from_slice(&len.to_le_bytes());
+
+        let doc = parse(&data).unwrap();
+        assert!(!doc.truncated);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let Node::Start { attributes, .. } = &doc.nodes[1] else {
+            panic!("expected the manifest start after the namespace");
+        };
+        let pairs: Vec<_> = attributes.iter().map(|a| (a.name.as_str(), a.value.as_str())).collect();
+        assert_eq!(pairs, [("package", fx::PACKAGE), ("versionCode", "42"), ("versionName", "1.2.3")]);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 <h1 align="center">Craft Anything</h1>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.ja.md">日本語</a> · <a href="README.zh.md">简体中文</a> · <a href="README.zh-hant.md">繁體中文</a> · <a href="README.ko.md">한국어</a> · <b>Español</b> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.pt.md">Português</a>
+  <a href="README.md">English</a> · <a href="README.ja.md">日本語</a> · <a href="README.zh.md">简体中文</a> · <a href="README.zh-hant.md">繁體中文</a> · <a href="README.ko.md">한국어</a> · <b>Español</b> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.pt.md">Português</a> · <a href="README.th.md">ไทย</a>
 </p>
 
 <p align="center">
@@ -422,6 +422,7 @@ El AppImage también lleva la CLI: ejecuta `<AppImage> --cli <comando>` (por eje
 | <img src="https://raw.githubusercontent.com/storytold/cadcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.cadcraft.png" alt="" width="32" height="32"> | **CADCraft** | Diseño asistido por computadora | [GitHub](https://github.com/storytold/cadcraft) | [Sitio web](https://getartcraft.com/apps/cadcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/gridcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.gridcraft.png" alt="" width="32" height="32"> | **GridCraft** | Hojas de cálculo y datos | [GitHub](https://github.com/storytold/gridcraft) | [Sitio web](https://getartcraft.com/apps/gridcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/texturecraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.texturecraft.png" alt="" width="32" height="32"> | **TextureCraft** | Pintura de texturas 3D | [GitHub](https://github.com/storytold/texturecraft) | [Sitio web](https://getartcraft.com/apps/texturecraft) |
+| <img src="https://raw.githubusercontent.com/storytold/materialcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.materialcraft.png" alt="" width="32" height="32"> | **MaterialCraft** | Materiales procedurales por nodos | [GitHub](https://github.com/storytold/materialcraft) | [Sitio web](https://getartcraft.com/apps/materialcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/craft-anything/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.craft-anything.png" alt="" width="32" height="32"> | **Craft Anything** | Ver cómo funciona cualquier software y construir el tuyo | [GitHub](https://github.com/storytold/craft-anything) | [Sitio web](https://getartcraft.com/apps/craft-anything) |
 | <img src="https://raw.githubusercontent.com/tangency-labs/solidcraft/main/assets/icons/app/linux/exports/hicolor/64x64/apps/io.tangencylabs.solidcraft.png" alt="" width="32" height="32"> | **SolidCraft** | CAD 3D paramétrico de Tangency Labs (app de la comunidad) | [GitHub](https://github.com/tangency-labs/solidcraft) | |
 

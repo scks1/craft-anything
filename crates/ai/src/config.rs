@@ -11,6 +11,10 @@
 //! effort = "high"
 //! # Conversation trimming budget; does not set the server's context window.
 //! context_tokens = 120000
+//! # For a service that limits requests: wait so that no more than this many are sent a minute.
+//! requests_per_minute = 60
+//! # Which tools a builder on it is offered: auto (the default), lean or full.
+//! tools = "auto"
 //!
 //! [ai.roles]
 //! lead = "Claude"
@@ -65,6 +69,37 @@ pub(crate) fn save_agent_selection(
     Ok(true)
 }
 
+/// Which tools a builder on an API backend is offered (Settings → AI, `ai tools`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolList {
+    /// Every tool when the conversation's budget has room for them (a window of 64k or more on a
+    /// local model, see [`crate::agent::FULL_TOOLS_BUDGET`]), else the lean list. Models on paid
+    /// services always get every tool.
+    #[default]
+    Auto,
+    /// The tools for building only (#417): what a small local model can use without exploring.
+    Lean,
+    /// Every tool, and the memory steps in the system prompt, whatever the window.
+    Full,
+}
+
+impl ToolList {
+    pub const ALL: [ToolList; 3] = [ToolList::Auto, ToolList::Lean, ToolList::Full];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolList::Auto => "auto",
+            ToolList::Lean => "lean",
+            ToolList::Full => "full",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ToolList> {
+        ToolList::ALL.into_iter().find(|t| t.as_str().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
 /// Per-backend options beyond [`BackendConfig`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -83,9 +118,20 @@ pub struct BackendOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
     /// Input tokens before trimming and summarising the conversation. Omitted or zero uses the
-    /// local/cloud default; this does not change the model server's own context window.
+    /// local/cloud default, fitted to the window the server says it has (`crate::window`): a local
+    /// server's budget becomes three quarters of it, while a window a paid service names ahead of
+    /// time only ever lowers its 150k default (a bigger budget there must be set here). A window a
+    /// server names when it refuses a request is three quarters of it on any backend. This does
+    /// not change the model server's own context window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
+    /// API backends: the most requests to send in a minute, for a service that limits them (120
+    /// for two a second). Requests wait their turn. Omitted or zero sends them as they come.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_per_minute: Option<u32>,
+    /// Which tools a builder on it is offered ([`ToolList`]). Omitted is Auto.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolList>,
     /// Agent CLIs: the program to run instead of the default for `model`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -107,7 +153,8 @@ pub struct BackendOptions {
     pub cli_reasoning_effort: Option<CliReasoningEffort>,
     /// Wall-clock limit in seconds for one turn. An agent CLI's whole turn (default: 24 hours for a
     /// builder, which may analyse and build a big game; 30 minutes for questions), or an API
-    /// backend's streamed answer (default: one hour; a slow local model may need longer).
+    /// backend's streamed answer, waiting for it to start included (default: five minutes to start,
+    /// one hour in all; a slow local model, or one queued behind another tool, may need longer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Agent CLIs that speak ACP (`cli_agents::acp::ACP_AGENTS`): chat over it, one agent process
@@ -412,6 +459,7 @@ mod tests {
         a.options.effort = Some(Effort::High);
         a.options.fallbacks_enabled = Some(false);
         a.options.context_tokens = Some(120_000);
+        a.options.requests_per_minute = Some(60);
         c.upsert(a);
         c.upsert(entry("Local", BackendKind::OpenaiCompatible));
         c.roles.insert("reviewer".into(), "Local".into());
@@ -425,6 +473,7 @@ mod tests {
         assert!(text.contains("[[ai.backends]]"), "{text}");
         assert!(text.contains("effort = \"high\""), "{text}");
         assert!(text.contains("context_tokens = 120000"), "{text}");
+        assert!(text.contains("requests_per_minute = 60"), "{text}");
     }
 
     #[test]
@@ -445,6 +494,26 @@ mod tests {
         for line in ["context_tokens = -1", "context_tokens = \"8000\"", "context_tokens = 8.5"] {
             assert_eq!(AiConfig::from_table(&table(line)).unwrap_err().code, ErrorCode::BadSettings);
         }
+    }
+
+    #[test]
+    fn backend_tool_list_is_optional_and_validated() {
+        let table = |line: &str| -> toml::Table {
+            toml::from_str(&format!("[[backends]]\nname = \"Local\"\nkind = \"openai_compatible\"\nmodel = \"qwen3:8b\"\n{line}")).unwrap()
+        };
+        for (line, expected) in
+            [("", None), ("tools = \"auto\"", Some(ToolList::Auto)), ("tools = \"lean\"", Some(ToolList::Lean)), ("tools = \"full\"", Some(ToolList::Full))]
+        {
+            let config = AiConfig::from_table(&table(line)).unwrap();
+            assert_eq!(config.backends[0].options.tools, expected, "{line}");
+            assert_eq!(AiConfig::from_table(&config.to_table().unwrap()).unwrap(), config);
+        }
+        for line in ["tools = \"all\"", "tools = 1"] {
+            assert_eq!(AiConfig::from_table(&table(line)).unwrap_err().code, ErrorCode::BadSettings, "{line}");
+        }
+        assert_eq!(ToolList::parse(" Full "), Some(ToolList::Full));
+        assert!(ToolList::ALL.iter().all(|t| ToolList::parse(t.as_str()) == Some(*t)));
+        assert_eq!(ToolList::parse("everything"), None);
     }
 
     #[test]
