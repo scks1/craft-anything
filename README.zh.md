@@ -16,7 +16,7 @@
 <h1 align="center">Craft Anything</h1>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.ja.md">日本語</a> · <b>简体中文</b> · <a href="README.zh-hant.md">繁體中文</a> · <a href="README.ko.md">한국어</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.pt.md">Português</a>
+  <a href="README.md">English</a> · <a href="README.ja.md">日本語</a> · <b>简体中文</b> · <a href="README.zh-hant.md">繁體中文</a> · <a href="README.ko.md">한국어</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.pt.md">Português</a> · <a href="README.th.md">ไทย</a>
 </p>
 
 <p align="center">
@@ -238,6 +238,27 @@ craft-anything-cli rebuild - "Add a contact form" --project-folder "<your folder
 |---|---|---|
 | 应用，通用版（Apple silicon + Intel） | `craft-anything-<ver>-macos-universal.dmg` | 已签名并公证 |
 | 命令行工具，通用版 | `craft-anything-cli-<ver>-macos-universal.zip` | 已签名并公证 |
+
+#### 检查 Mac 下载是否已签名并公证
+
+每个 Mac 版本都用 Developer ID 证书签名,并通过 Apple 公证。想自己检查,请在终端运行以下命令(把 `<ver>` 换成版本号,路径换成你的):
+
+```sh
+# 磁盘映像:"accepted" 和 "source=Notarized Developer ID" 表示通过
+spctl --assess --type open --context context:primary-signature -v "craft-anything-<ver>-macos-universal.dmg"
+# 公证票据已附加:会输出 "The validate action worked!"
+xcrun stapler validate "craft-anything-<ver>-macos-universal.dmg"
+
+# 应用(打开磁盘映像后):签名必须验证通过
+codesign --verify --deep --strict --verbose=2 "/Volumes/<disk image name>/Craft Anything.app"
+spctl --assess --type execute --verbose "/Volumes/<disk image name>/Craft Anything.app"
+
+# 命令行工具:独立程序无法携带票据,macOS 会在线上检查
+codesign --verify --strict --verbose=2 ~/.local/bin/craft-anything-cli
+codesign -dv --verbose=4 ~/.local/bin/craft-anything-cli 2>&1 | grep Authority
+```
+
+`Authority` 行应显示 "Developer ID Application" 证书。检查失败时不要运行该文件,请把输出和发布标签一起报告。
 
 ### Linux
 

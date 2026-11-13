@@ -912,6 +912,7 @@ Read a Unity game's IL2CPP metadata	Unity თამაშის IL2CPP მეტ
 Read a game's files	თამაშის ფაილების წაკითხვა
 Read a project file	პროექტის ფაილის წაკითხვა
 Read a setting	პარამეტრის წაკითხვა
+Read a text file	ტექსტური ფაილის წაკითხვა
 Read an app's screen	აპის ეკრანის წაკითხვა
 Read bytes	ბაიტების წაკითხვა
 Read comment	კომენტარის წაკითხვა
@@ -1462,3 +1463,28 @@ In this project, {kind}: {choice}.	ამ პროექტში {kind}: {choi
 Couldn't change the approvals:	ნებართვების შეცვლა ვერ მოხერხდა:
 What the builder may do without asking you, in this project.	რისი გაკეთება შეუძლია ამწყობს ამ პროექტში თქვენი კითხვის გარეშე.
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	ნაგულისხმევი ავტორეჟიმს მიჰყვება: როცა ჩართულია, რისი გაუქმებაც შეიძლება, სრულდება, დანარჩენი კი უარყოფილია; როცა გამორთულია, ამწყობი გეკითხებათ.
+Connecting to {name}… {seconds} s	{name}-თან დაკავშირება… {seconds} წმ
+Stopped adding {name}.	{name}-ის დამატება შეჩერდა.
+It isn't there any more, so {program} runs in its place.	ის აღარ არის იქ, ამიტომ მის ნაცვლად {program} ეშვება.
+Use it	გამოყენება
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	ამ აპის ვერსიას ArtCraft Launcher მართავს. ვერსია იქ შეცვალეთ.
+Check again	ხელახლა შემოწმება
+Check for Updates	განახლებების შემოწმება
+Check for Updates…	განახლებების შემოწმება…
+Checking for updates…	მიმდინარეობს განახლებების შემოწმება…
+Couldn't check for updates: {error}	განახლებების შემოწმება ვერ მოხერხდა: {error}
+Downloading and verifying the update…	მიმდინარეობს განახლების ჩამოტვირთვა და შემოწმება…
+No installer is available for this platform.	ამ პლატფორმისთვის დამყენებელი ხელმისაწვდომი არ არის.
+Releases	გამოშვებები
+Save your work and stop running tasks before installing an update.	განახლების დაყენებამდე შეინახეთ ნამუშევარი და შეაჩერეთ მიმდინარე ამოცანები.
+The update failed: {error}	განახლება ვერ მოხერხდა: {error}
+The update worker stopped unexpectedly. Try checking again.	განახლების პროცესი მოულოდნელად შეწყდა. სცადეთ ხელახლა შემოწმება.
+This installation is managed externally. Update it with its package manager or open Releases.	ეს ინსტალაცია გარედან იმართება. განაახლეთ პაკეტების მმართველით ან გახსენით გამოშვებები.
+Update and restart	განახლება და ხელახლა გაშვება
+Update ready. Restarting…	განახლება მზადაა. მიმდინარეობს ხელახლა გაშვება…
+Updated to {version}.	განახლდა {version} ვერსიამდე.
+Use Releases or your package manager to update this installation.	ამ ინსტალაციის გასაახლებლად გამოიყენეთ გამოშვებები ან პაკეტების მმართველი.
+You're up to date.	უახლეს ვერსიას იყენებთ.
+{version} is available.	ხელმისაწვდომია {version}.

@@ -39,6 +39,14 @@ fn is_ident_part(b: u8) -> bool {
     is_ident_start(b) || b.is_ascii_digit()
 }
 
+fn line_terminator_len(src: &str, offset: usize) -> usize {
+    match src.as_bytes().get(offset) {
+        Some(b'\n' | b'\r') => 1,
+        Some(0xe2) if src.get(offset..).is_some_and(|rest| rest.starts_with('\u{2028}') || rest.starts_with('\u{2029}')) => 3,
+        _ => 0,
+    }
+}
+
 /// Tokenize `src`, stopping after `max_tokens` (the flag says whether it stopped early).
 pub fn tokenize(src: &str, max_tokens: usize) -> (Vec<Token<'_>>, bool) {
     let mut out = Vec::new();
@@ -56,20 +64,25 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
     let slice = |a: usize, z: usize| src.get(a..z).unwrap_or("");
     let mut last_sig: Option<(TokKind, &str)> = None;
     while i < b.len() {
-        if count >= max_tokens {
-            return true;
-        }
-        count += 1;
         let c = b.get(i).copied().unwrap_or(0);
         if c.is_ascii_whitespace() {
             i += 1;
             continue;
         }
+        let line_end = line_terminator_len(src, i);
+        if line_end != 0 {
+            i += line_end;
+            continue;
+        }
+        if count >= max_tokens {
+            return true;
+        }
+        count += 1;
         let start = i;
         let next = b.get(i + 1).copied().unwrap_or(0);
         // Comments.
         if c == b'/' && next == b'/' {
-            while i < b.len() && b.get(i) != Some(&b'\n') {
+            while i < b.len() && line_terminator_len(src, i) == 0 {
                 i += 1;
             }
             emit(Token { kind: TokKind::Comment, text: slice(start, i), offset: start });
@@ -90,7 +103,7 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
             while let Some(&d) = b.get(i) {
                 i += 1;
                 if d == b'\\' {
-                    i += 1;
+                    i += if b.get(i) == Some(&b'\r') && b.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
                 } else if d == c || d == b'\n' {
                     break;
                 }
@@ -121,13 +134,20 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
             i = i.min(b.len());
             tok_kind = TokKind::Template;
         } else if is_ident_start(c) {
-            while b.get(i).is_some_and(|&d| is_ident_part(d)) {
+            while b.get(i).is_some_and(|&d| is_ident_part(d) && (d < 0x80 || line_terminator_len(src, i) == 0)) {
                 i += 1;
             }
             tok_kind = TokKind::Ident;
         } else if c.is_ascii_digit() || (c == b'.' && next.is_ascii_digit()) {
-            while b.get(i).is_some_and(|&d| d.is_ascii_alphanumeric() || d == b'.' || d == b'_') {
-                i += 1;
+            let radix = c == b'0' && matches!(next, b'x' | b'X' | b'b' | b'B' | b'o' | b'O');
+            while let Some(&d) = b.get(i) {
+                let exp_sign =
+                    !radix && matches!(d, b'+' | b'-') && matches!(b.get(i.wrapping_sub(1)), Some(b'e' | b'E')) && b.get(i + 1).is_some_and(u8::is_ascii_digit);
+                if d.is_ascii_alphanumeric() || d == b'.' || d == b'_' || exp_sign {
+                    i += 1;
+                } else {
+                    break;
+                }
             }
             tok_kind = TokKind::Number;
         } else if c == b'/' && regex_allowed(last_sig) {
@@ -150,8 +170,8 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
             i = i.min(b.len());
             tok_kind = TokKind::Regex;
         } else {
-            let rest = slice(i, (i + 4).min(b.len()));
-            let len = PUNCTS.iter().find(|p| rest.starts_with(**p)).map_or(1, |p| p.len());
+            let rest = b.get(i..).unwrap_or_default();
+            let len = PUNCTS.iter().find(|p| rest.starts_with(p.as_bytes())).map_or(1, |p| p.len());
             // Never split a multi-byte character.
             let mut z = i + len;
             while z < b.len() && !src.is_char_boundary(z) {
@@ -204,6 +224,9 @@ pub fn unescape(s: &str) -> String {
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
             Some('r') => out.push('\r'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('v') => out.push('\u{b}'),
             Some('0') => out.push('\0'),
             Some('x') => {
                 let h: String = it.by_ref().take(2).collect();
@@ -218,11 +241,25 @@ pub fn unescape(s: &str) -> String {
                 } else {
                     it.by_ref().take(4).collect()
                 };
-                if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                    out.push(ch);
+                let Ok(mut code) = u32::from_str_radix(&hex, 16) else { continue };
+                if (0xD800..0xDC00).contains(&code) {
+                    let mut ahead = it.clone();
+                    if ahead.next() == Some('\\') && ahead.next() == Some('u') {
+                        let lo: String = ahead.by_ref().take(4).collect();
+                        if let Some(lo) = u32::from_str_radix(&lo, 16).ok().filter(|l| lo.len() == 4 && (0xDC00..0xE000).contains(l)) {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                            it = ahead;
+                        }
+                    }
                 }
+                out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
             }
             Some('\n') => {}
+            Some('\r') => {
+                if it.peek() == Some(&'\n') {
+                    it.next();
+                }
+            }
             Some(other) => out.push(other),
             None => {}
         }
@@ -310,6 +347,60 @@ mod tests {
 
     fn kinds(s: &str) -> Vec<(TokKind, String)> {
         tokenize(s, 1000).0.into_iter().map(|t| (t.kind, t.text.to_string())).collect()
+    }
+
+    #[test]
+    fn operators_before_non_ascii_identifier() {
+        for (src, op) in [("a===日本", "==="), ("a>>日本", ">>"), ("a=>é", "=>"), ("a!==😀", "!==")] {
+            let t: Vec<&str> = tokenize(src, 100).0.into_iter().map(|t| t.text).collect();
+            assert_eq!(t.len(), 3, "{src}: {t:?}");
+            assert_eq!(t[1], op, "{src}");
+        }
+    }
+
+    #[test]
+    fn whitespace_does_not_count_against_limit() {
+        let (t, truncated) = tokenize("a b c d", 4);
+        assert_eq!(t.len(), 4);
+        assert!(!truncated);
+        let (t, truncated) = tokenize("a b c d", 3);
+        assert_eq!(t.len(), 3);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn exponent_sign() {
+        let texts = |s: &str| tokenize(s, 100).0.into_iter().map(|t| t.text.to_string()).collect::<Vec<_>>();
+        assert_eq!(texts("x = 1e+5 + 2.5E-3;"), ["x", "=", "1e+5", "+", "2.5E-3", ";"]);
+        assert_eq!(texts("0x1e+5"), ["0x1e", "+", "5"]);
+    }
+
+    #[test]
+    fn crlf_line_continuation_stays_in_string() {
+        let k = kinds("x = 'a\\\r\nb';");
+        assert!(k.contains(&(TokKind::Str, "'a\\\r\nb'".into())), "{k:?}");
+        assert!(k.contains(&(TokKind::Punct, ";".into())), "{k:?}");
+    }
+
+    #[test]
+    fn unescape_crlf_line_continuation() {
+        assert_eq!(unescape("a\\\r\nb"), "ab");
+        assert_eq!(unescape("a\\\rb"), "ab");
+        assert_eq!(unescape("a\\\nb"), "ab");
+    }
+
+    #[test]
+    fn unescape_backspace_formfeed_vtab() {
+        assert_eq!(unescape(r"a\fb\vc\bd"), "a\u{c}b\u{b}c\u{8}d");
+        assert_eq!(string_value(r#""\b\f\v""#), "\u{8}\u{c}\u{b}");
+    }
+
+    #[test]
+    fn unescape_combines_surrogate_pairs() {
+        assert_eq!(unescape("\\uD83D\\uDE00"), "😀");
+        assert_eq!(unescape("a\\uD83D\\u0041"), "a\u{FFFD}A");
+        assert_eq!(unescape("\\uDE00x"), "\u{FFFD}x");
+        assert_eq!(unescape("\\u{1F600}"), "😀");
     }
 
     #[test]

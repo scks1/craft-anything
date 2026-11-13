@@ -24,6 +24,13 @@ mod linux_gpu;
 /// Opens the window on the engine and AI hub (a path on the command line opens as the first
 /// target); if the window can't start, says why and where its log is.
 fn main() -> eframe::Result {
+    if let Some(result) = craft_anything_ui_egui::updates::finish_helper() {
+        let failed = result.is_err();
+        if let Err(error) = result {
+            eprintln!("Update failed: {error}");
+        }
+        std::process::exit(i32::from(failed));
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("craft-anything {}", env!("CARGO_PKG_VERSION"));
@@ -54,6 +61,28 @@ fn main() -> eframe::Result {
     layer_tools.extend(craft_anything_setup::tools::specs());
     let engine = Engine::shared_with(session, layer_tools, plugins);
     let hub = Arc::new(AiHub::new(engine.clone()));
+    // Before the window opens, while no session lock is held (#1225).
+    match hub.ensure_session_id() {
+        Ok(true) => log::info!("made this installation's OpenCode Go session id"),
+        Ok(false) => {}
+        Err(e) => log::warn!("couldn't save the OpenCode Go session id: {e}"),
+    }
+    // Sessions a turn left unfinished when Craft Anything was killed mid-turn (#1115): they are
+    // otherwise swept at the next agent turn or on uninstall, and the agent's own service can
+    // resume one in the meantime. Off this thread: a delete over SSH can wait on a host that's
+    // away, and a start must not wait for it.
+    let startup_config = config.clone();
+    // The built-in adapters alone: a fork's adapters register elsewhere, and records they own are
+    // kept and cleaned at the next turn.
+    if let Err(e) = std::thread::Builder::new().name("unfinished-sessions".into()).spawn(move || {
+        let said =
+            craft_anything_ai::cli_agents::unfinished::sweep_at_startup(&startup_config, &craft_anything_ai::cli_agents::adapters::AgentAdapters::built_in());
+        for text in said {
+            log::info!("{text}");
+        }
+    }) {
+        log::warn!("couldn't start the unfinished-session sweep: {e}");
+    }
     log::info!("engine and AI ready; opening the window");
 
     let viewport = eframe::egui::ViewportBuilder::default()
@@ -109,6 +138,7 @@ fn main() -> eframe::Result {
                 log::info!("window open");
                 CraftApp::setup_context(&cc.egui_ctx);
                 let mut app = CraftApp::new(engine, hub);
+                app.show_update_outcome_on_start();
                 // The window is built hidden and its first frame is drawn afterwards, where a graphics
                 // driver may still crash: the mark stays until frames have been shown (#74).
                 app.after_first_frames(move || {
@@ -146,7 +176,7 @@ fn main() -> eframe::Result {
             // Without a window the app would just vanish (#166): say why, and where the log is.
             let log = craft_anything_engine::settings::config_dir().join("desktop.log");
             #[cfg(windows)]
-            let retry = renderer.map(|r| format!(" The next start will draw with {}.", renderer::choose(Some(r), true).title())).unwrap_or_default();
+            let retry = next_start_note(renderer, shown.load(std::sync::atomic::Ordering::Relaxed));
             #[cfg(not(windows))]
             let retry = String::new();
             let _ = rfd::MessageDialog::new()
@@ -177,6 +207,17 @@ fn dx12_compiler(from_env: Option<eframe::wgpu::Dx12Compiler>) -> eframe::wgpu::
 #[cfg_attr(all(not(windows), not(test)), expect(dead_code, reason = "only Windows picks its own graphics adapter"))]
 fn wants_software(setting: Option<&str>) -> bool {
     setting.is_some_and(|s| s.trim().eq_ignore_ascii_case("software"))
+}
+
+/// What the error dialog says the next start will do. Only a start whose window was never shown
+/// leaves its mark, so only then does the next start move on to another renderer; after the window
+/// was shown the next start draws as this one did, and the dialog says nothing about it.
+#[cfg(windows)]
+fn next_start_note(renderer: Option<renderer::Renderer>, shown: bool) -> String {
+    match renderer {
+        Some(r) if !shown => format!(" The next start will draw with {}.", renderer::choose(Some(r), true).title()),
+        _ => String::new(),
+    }
 }
 
 /// The result of a run that may have panicked. A panic before the window's first frames were shown
@@ -467,5 +508,16 @@ mod graphics_tests {
     #[test]
     fn wants_software_reads_the_setting() {
         assert!(wants_software(Some(" Software ")) && !wants_software(Some("gpu")) && !wants_software(None));
+    }
+
+    /// #909 review: only a start whose window never showed moves on to another renderer, so only
+    /// then does the dialog say the next start will draw differently.
+    #[cfg(windows)]
+    #[test]
+    fn the_dialog_promises_another_renderer_only_before_the_window_was_shown() {
+        use renderer::Renderer;
+        assert_eq!(next_start_note(Some(Renderer::Dx12), false), " The next start will draw with Windows' software renderer.");
+        assert_eq!(next_start_note(Some(Renderer::Dx12), true), "");
+        assert_eq!(next_start_note(None, false), "", "a renderer from the environment is never changed");
     }
 }

@@ -11,6 +11,8 @@
 //! effort = "high"
 //! # Conversation trimming budget; does not set the server's context window.
 //! context_tokens = 120000
+//! # For a service that limits requests: wait so that no more than this many are sent a minute.
+//! requests_per_minute = 60
 //!
 //! [ai.roles]
 //! lead = "Claude"
@@ -82,10 +84,15 @@ pub struct BackendOptions {
     /// Most model turns per user message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
-    /// Input tokens before trimming and summarising the conversation. Omitted or zero uses the
-    /// local/cloud default; this does not change the model server's own context window.
+    /// Input tokens before trimming and summarising the conversation. Omitted or zero uses three
+    /// quarters of the window the server says it has (`crate::window`), else the local/cloud default;
+    /// this does not change the model server's own context window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
+    /// API backends: the most requests to send in a minute, for a service that limits them (120
+    /// for two a second). Requests wait their turn. Omitted or zero sends them as they come.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_per_minute: Option<u32>,
     /// Agent CLIs: the program to run instead of the default for `model`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -105,12 +112,14 @@ pub struct BackendOptions {
     /// `none` is an explicit choice, not the absence of an override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_reasoning_effort: Option<CliReasoningEffort>,
-    /// Wall-clock limit in seconds for one agent CLI turn (default: 24 hours for a builder, which may
-    /// analyse and build a big game; 30 minutes for questions).
+    /// Wall-clock limit in seconds for one turn. An agent CLI's whole turn (default: 24 hours for a
+    /// builder, which may analyse and build a big game; 30 minutes for questions), or an API
+    /// backend's streamed answer, waiting for it to start included (default: five minutes to start,
+    /// one hour in all; a slow local model, or one queued behind another tool, may need longer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Agent CLIs that speak ACP (`cli_agents::acp::ACP_AGENTS`): chat over it, one agent process
-    /// per conversation (on for Copilot, off for other agents unless set).
+    /// per conversation (on for Copilot and Grok Build, off for other agents unless set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp: Option<bool>,
     /// Agent CLIs that keep their sign-in, settings and sessions in a folder of their own (Claude
@@ -411,6 +420,7 @@ mod tests {
         a.options.effort = Some(Effort::High);
         a.options.fallbacks_enabled = Some(false);
         a.options.context_tokens = Some(120_000);
+        a.options.requests_per_minute = Some(60);
         c.upsert(a);
         c.upsert(entry("Local", BackendKind::OpenaiCompatible));
         c.roles.insert("reviewer".into(), "Local".into());
@@ -424,6 +434,7 @@ mod tests {
         assert!(text.contains("[[ai.backends]]"), "{text}");
         assert!(text.contains("effort = \"high\""), "{text}");
         assert!(text.contains("context_tokens = 120000"), "{text}");
+        assert!(text.contains("requests_per_minute = 60"), "{text}");
     }
 
     #[test]

@@ -16,6 +16,35 @@ const MAX_UNWIND: usize = 500_000;
 const MAX_IMPORT_ROWS: usize = 200_000;
 /// Most exported entries kept from one file.
 const MAX_EXPORTS: usize = 200_000;
+/// Most decoded name bytes retained by an import or export table by default.
+pub const DEFAULT_MAX_TABLE_TEXT_BYTES: usize = 64 << 20;
+
+struct TableTextBudget {
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl TableTextBudget {
+    fn new(bytes: usize) -> Self {
+        Self { remaining: bytes, exhausted: false }
+    }
+
+    fn take(&mut self, bytes: usize) -> bool {
+        if self.exhausted || bytes > self.remaining {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= bytes;
+        true
+    }
+
+    fn finish(&self, truncated: &mut bool, warnings: &mut Vec<String>) {
+        if self.exhausted {
+            *truncated = true;
+            warnings.push("the table's retained name-byte budget was reached; later names were omitted".into());
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PeSection {
@@ -36,6 +65,7 @@ pub struct PeHeaders {
     pub pe32_plus: bool,
     pub image_base: u64,
     pub entry_rva: u32,
+    pub size_of_headers: u32,
     pub subsystem: u16,
     pub dll_characteristics: u16,
     pub linker: (u8, u8),
@@ -56,8 +86,39 @@ impl PeHeaders {
                 return usize::try_from(s.raw_offset.checked_add(delta)?).ok();
             }
         }
-        let first = self.sections.iter().map(|s| s.raw_offset).filter(|o| *o > 0).min().unwrap_or(u32::MAX);
-        if rva < first { usize::try_from(rva).ok() } else { None }
+        if rva < self.size_of_headers { usize::try_from(rva).ok() } else { None }
+    }
+
+    fn image_va(&self, rva: u64) -> Option<u64> {
+        let rva = u32::try_from(rva).ok()?;
+        let address = self.image_base.checked_add(u64::from(rva))?;
+        (self.pe32_plus || address <= u64::from(u32::MAX)).then_some(address)
+    }
+
+    /// Bytes remaining in the selected RVA mapping before file offsets stop being contiguous.
+    fn rva_file_len(&self, rva: u32) -> Option<usize> {
+        let base = self.rva_to_offset(rva)?;
+        let next_section_distance = |count: usize| {
+            self.sections
+                .iter()
+                .take(count)
+                .filter(|s| s.virtual_size.max(s.raw_size) > 0)
+                .filter_map(|s| s.rva.checked_sub(rva))
+                .filter(|&distance| distance > 0)
+                .min()
+                .unwrap_or(u32::MAX)
+        };
+        match self.sections.iter().enumerate().find(|(_, s)| rva.checked_sub(s.rva).is_some_and(|delta| delta < s.virtual_size.max(s.raw_size))) {
+            Some((index, s)) => rva.checked_sub(s.rva).and_then(|delta| s.raw_size.checked_sub(delta)).map(|len| len.min(next_section_distance(index))),
+            None => self.size_of_headers.checked_sub(rva).map(|len| len.min(next_section_distance(self.sections.len()))),
+        }
+        .map(u64::from)
+        .and_then(|len| {
+            let address_end = u64::from(u32::MAX) + 1;
+            let remaining_rvas = address_end.checked_sub(u64::from(rva))?;
+            let remaining_offsets = address_end.checked_sub(u64::try_from(base).ok()?)?;
+            usize::try_from(len.min(remaining_rvas).min(remaining_offsets)).ok()
+        })
     }
 
     pub fn dir(&self, i: usize) -> Option<(u32, u32)> {
@@ -126,6 +187,7 @@ pub fn headers(data: &[u8]) -> Result<PeHeaders, FormatError> {
         pe32_plus,
         image_base,
         entry_rva: optional.u32_le(16).unwrap_or(0),
+        size_of_headers: optional.u32_le(60).unwrap_or(0),
         subsystem: optional.u16_le(68).unwrap_or(0),
         dll_characteristics: optional.u16_le(70).unwrap_or(0),
         linker: (optional.u8(2).unwrap_or(0), optional.u8(3).unwrap_or(0)),
@@ -178,11 +240,11 @@ pub struct PeImport {
     pub slot_va: u64,
 }
 
-/// Walk the import directory: every imported function and the IAT slot the loader fills.
+/// Walk the import directory, retaining functions with representable IAT slot addresses.
 pub fn imports(data: &[u8], h: &PeHeaders) -> Vec<PeImport> {
     let mut table = ImportTable::default();
-    normal_imports(data, h, &mut table);
-    table.rows.into_iter().map(|row| PeImport { library: row.library, name: row.name, ordinal: row.ordinal, slot_va: row.slot_va.unwrap_or(0) }).collect()
+    normal_imports(data, h, &mut table, &mut TableTextBudget::new(DEFAULT_MAX_TABLE_TEXT_BYTES));
+    table.rows.into_iter().filter_map(|row| Some(PeImport { slot_va: row.slot_va?, library: row.library, name: row.name, ordinal: row.ordinal })).collect()
 }
 
 /// How a program links to an imported function.
@@ -236,7 +298,7 @@ pub struct BoundModule {
 pub struct ImportTable {
     pub rows: Vec<ImportRow>,
     pub bound_modules: Vec<BoundModule>,
-    /// A cap stopped the walk: more rows may exist.
+    /// A cap or incomplete directory stopped the walk: more rows may exist.
     pub truncated: bool,
     pub warnings: Vec<String>,
 }
@@ -257,23 +319,56 @@ fn thunk_target(r: &Reader<'_>, h: &PeHeaders, v: u64, name_rva: impl Fn(u64) ->
     (name, hint, None)
 }
 
-fn normal_imports(data: &[u8], h: &PeHeaders, out: &mut ImportTable) {
-    let r = Reader::new(data);
-    let Some((rva, _)) = h.dir(1) else { return };
-    let Some(start) = h.rva_to_offset(rva) else {
-        out.warnings.push(format!("the import directory at RVA {rva:#x} is outside the file"));
-        return;
+fn mapped_import_directory<'a>(data: &'a [u8], h: &PeHeaders, rva: u32, size: u32, label: &str, out: &mut ImportTable) -> Option<Reader<'a>> {
+    let Some((start, mapped)) = h.rva_to_offset(rva).zip(h.rva_file_len(rva)) else {
+        out.truncated = true;
+        out.warnings.push(format!("the {label} directory at RVA {rva:#x} is outside the file"));
+        return None;
     };
+    let available = data.get(start..).unwrap_or_default();
+    let len = mapped.min(available.len());
+    if len < size as usize {
+        out.truncated = true;
+        out.warnings.push(format!("the {label} directory extends beyond its mapped file bytes"));
+    }
+    Some(Reader::new(available.get(..len).unwrap_or_default()))
+}
+
+fn import_directory<'a>(data: &'a [u8], h: &PeHeaders, index: usize, label: &str, out: &mut ImportTable) -> Option<Reader<'a>> {
+    let (rva, size) = h.dir(index)?;
+    let mapped = mapped_import_directory(data, h, rva, size, label, out)?;
+    Some(Reader::new(mapped.slice(0, mapped.len().min(size as usize))?))
+}
+
+fn normal_imports(data: &[u8], h: &PeHeaders, out: &mut ImportTable, budget: &mut TableTextBudget) {
+    if budget.exhausted {
+        return;
+    }
+    let r = Reader::new(data);
+    let Some((rva, size)) = h.data_dirs.get(1).copied().filter(|(rva, _)| *rva != 0) else { return };
+    let Some(directory) = mapped_import_directory(data, h, rva, size, "import", out) else { return };
     let thunk_size = if h.pe32_plus { 8usize } else { 4 };
+    let mut warned_size = false;
     for d in 0..MAX_IMPORT_DESCRIPTORS {
-        let Some(desc) = d.checked_mul(20).and_then(|o| start.checked_add(o)) else { break };
+        let desc = d * 20;
+        if directory.slice(desc, 20).is_none() {
+            out.truncated = true;
+            out.warnings.push("the import descriptor table ends before a complete terminator".into());
+            return;
+        }
+        // Windows follows descriptors to their terminator even when Size is zero or too short.
+        // The selected file mapping remains the hard boundary; Size is diagnostic only.
+        if desc + 20 > size as usize && !warned_size {
+            out.warnings.push("the import descriptor table extends beyond its declared size".into());
+            warned_size = true;
+        }
         let (Some(oft), Some(stamp), Some(name_rva), Some(ft)) =
-            (r.u32_le(desc), r.u32_le(desc.saturating_add(4)), r.u32_le(desc.saturating_add(12)), r.u32_le(desc.saturating_add(16)))
+            (directory.u32_le(desc), directory.u32_le(desc + 4), directory.u32_le(desc + 12), directory.u32_le(desc + 16))
         else {
             break;
         };
         if oft == 0 && name_rva == 0 && ft == 0 {
-            break;
+            return;
         }
         let library = h.rva_to_offset(name_rva).and_then(|o| r.cstr(o, 256)).unwrap_or_default();
         let bound = stamp != 0;
@@ -295,10 +390,15 @@ fn normal_imports(data: &[u8], h: &PeHeaders, out: &mut ImportTable) {
                 break;
             }
             let (name, hint, ordinal) = thunk_target(&r, h, v, |v| u32::try_from(v & 0x7fff_ffff).ok());
-            let slot_va = h.image_base.wrapping_add(u64::from(ft)).wrapping_add((i * thunk_size) as u64);
-            out.rows.push(ImportRow { library: library.clone(), kind: ImportKind::Normal, name, ordinal, hint, slot_va: Some(slot_va), bound });
+            if !budget.take(library.len().saturating_add(name.as_ref().map_or(0, String::len))) {
+                return;
+            }
+            let slot_va = u64::from(ft).checked_add((i * thunk_size) as u64).and_then(|rva| h.image_va(rva));
+            out.rows.push(ImportRow { library: library.clone(), kind: ImportKind::Normal, name, ordinal, hint, slot_va, bound });
         }
     }
+    out.truncated = true;
+    out.warnings.push(format!("only the first {MAX_IMPORT_DESCRIPTORS} import descriptors were read"));
 }
 
 /// An RVA held in a delay-load descriptor: old linkers wrote virtual addresses instead.
@@ -306,23 +406,27 @@ fn delay_rva(field: u32, rva_based: bool, image_base: u64) -> Option<u32> {
     if rva_based { Some(field) } else { u64::from(field).checked_sub(image_base).and_then(|v| u32::try_from(v).ok()) }
 }
 
-fn delay_imports(data: &[u8], h: &PeHeaders, out: &mut ImportTable) {
-    let r = Reader::new(data);
-    let Some((rva, _)) = h.dir(13) else { return };
-    let Some(start) = h.rva_to_offset(rva) else {
-        out.warnings.push(format!("the delay-load directory at RVA {rva:#x} is outside the file"));
+fn delay_imports(data: &[u8], h: &PeHeaders, out: &mut ImportTable, budget: &mut TableTextBudget) {
+    if budget.exhausted {
         return;
-    };
+    }
+    let r = Reader::new(data);
+    let Some(directory) = import_directory(data, h, 13, "delay-load", out) else { return };
     let thunk_size = if h.pe32_plus { 8usize } else { 4 };
     for d in 0..MAX_IMPORT_DESCRIPTORS {
-        let Some(desc) = d.checked_mul(32).and_then(|o| start.checked_add(o)) else { break };
+        let desc = d * 32;
+        if directory.slice(desc, 32).is_none() {
+            out.truncated = true;
+            out.warnings.push("the delay-load descriptor table ends before a complete terminator".into());
+            return;
+        }
         let (Some(attrs), Some(name_f), Some(iat_f), Some(int_f)) =
-            (r.u32_le(desc), r.u32_le(desc.saturating_add(4)), r.u32_le(desc.saturating_add(12)), r.u32_le(desc.saturating_add(16)))
+            (directory.u32_le(desc), directory.u32_le(desc + 4), directory.u32_le(desc + 12), directory.u32_le(desc + 16))
         else {
             break;
         };
         if name_f == 0 && iat_f == 0 && int_f == 0 {
-            break;
+            return;
         }
         let rva_based = attrs & 1 != 0;
         let conv = |f: u32| delay_rva(f, rva_based, h.image_base);
@@ -345,45 +449,96 @@ fn delay_imports(data: &[u8], h: &PeHeaders, out: &mut ImportTable) {
             let (name, hint, ordinal) = thunk_target(&r, h, v, |v| {
                 if rva_based { u32::try_from(v & 0x7fff_ffff).ok() } else { v.checked_sub(h.image_base).and_then(|x| u32::try_from(x).ok()) }
             });
-            let slot_va = iat.map(|a| h.image_base.wrapping_add(u64::from(a)).wrapping_add((i * thunk_size) as u64));
+            let slot_va = iat.and_then(|a| u64::from(a).checked_add((i * thunk_size) as u64)).and_then(|rva| h.image_va(rva));
+            if !budget.take(library.len().saturating_add(name.as_ref().map_or(0, String::len))) {
+                return;
+            }
             out.rows.push(ImportRow { library: library.clone(), kind: ImportKind::Delay, name, ordinal, hint, slot_va, bound: false });
         }
     }
+    out.truncated = true;
+    out.warnings.push(format!("only the first {MAX_IMPORT_DESCRIPTORS} delay-load descriptors were read"));
 }
 
-fn bound_modules(data: &[u8], h: &PeHeaders, out: &mut ImportTable) {
-    let r = Reader::new(data);
-    let Some((rva, size)) = h.dir(11) else { return };
-    let Some(start) = h.rva_to_offset(rva) else {
-        out.warnings.push(format!("the bound import directory at RVA {rva:#x} is outside the file"));
+fn bound_modules(data: &[u8], h: &PeHeaders, out: &mut ImportTable, budget: &mut TableTextBudget) {
+    if budget.exhausted {
         return;
-    };
-    let size = size as usize;
-    let mut pos = 0usize;
-    while pos < size && out.bound_modules.len() < MAX_IMPORT_DESCRIPTORS {
-        let Some(at) = start.checked_add(pos) else { break };
-        let (Some(stamp), Some(name_off), Some(refs)) = (r.u32_le(at), r.u16_le(at.saturating_add(4)), r.u16_le(at.saturating_add(6))) else { break };
-        if stamp == 0 && name_off == 0 {
-            break;
-        }
-        let name_of = |o: u16| start.checked_add(usize::from(o)).and_then(|p| r.cstr(p, 256)).unwrap_or_default();
-        let mut forwarders = Vec::new();
-        for i in 0..usize::from(refs) {
-            let Some(f) = (i + 1).checked_mul(8).and_then(|o| at.checked_add(o)) else { break };
-            let Some(o) = r.u16_le(f.saturating_add(4)) else { break };
-            forwarders.push(name_of(o));
-        }
-        out.bound_modules.push(BoundModule { name: name_of(name_off), timestamp: stamp, forwarders });
-        pos = pos.saturating_add((usize::from(refs) + 1) * 8);
     }
+    let Some(directory) = import_directory(data, h, 11, "bound import", out) else { return };
+    let mut pos = 0usize;
+    while out.bound_modules.len() < MAX_IMPORT_DESCRIPTORS {
+        if directory.slice(pos, 8).is_none() {
+            out.truncated = true;
+            out.warnings.push("the bound import table ends before a complete terminator".into());
+            return;
+        }
+        let (Some(stamp), Some(name_off), Some(refs)) = (directory.u32_le(pos), directory.u16_le(pos + 4), directory.u16_le(pos + 6)) else { return };
+        if stamp == 0 && name_off == 0 {
+            return;
+        }
+        let name_of = |offset: u16| {
+            let offset = usize::from(offset);
+            let bytes = directory.slice(offset, directory.len().checked_sub(offset)?.min(256))?;
+            let end = bytes.iter().position(|&byte| byte == 0)?;
+            Some(String::from_utf8_lossy(bytes.get(..end)?).into_owned())
+        };
+        let name = name_of(name_off);
+        if name.is_none() {
+            out.truncated = true;
+            out.warnings.push("a bound import name is outside its directory".into());
+        }
+        if !budget.take(name.as_ref().map_or(0, String::len)) {
+            return;
+        }
+        let refs_start = pos + 8;
+        let complete = directory.len().saturating_sub(refs_start) / 8;
+        let count = usize::from(refs).min(complete);
+        let mut forwarders = Vec::new();
+        let mut bad_forwarder = false;
+        for i in 0..count {
+            let at = refs_start + i * 8;
+            if let Some(name) = directory.u16_le(at + 4).and_then(name_of) {
+                if !budget.take(name.len()) {
+                    break;
+                }
+                forwarders.push(name);
+            } else {
+                bad_forwarder = true;
+            }
+        }
+        if bad_forwarder {
+            out.truncated = true;
+            out.warnings.push("a bound forwarder name is outside its directory".into());
+        }
+        out.bound_modules.push(BoundModule { name: name.unwrap_or_default(), timestamp: stamp, forwarders });
+        if budget.exhausted {
+            return;
+        }
+        if count < usize::from(refs) {
+            out.truncated = true;
+            out.warnings.push("the bound import forwarder records run past the directory".into());
+            return;
+        }
+        pos = refs_start + count * 8;
+    }
+    out.truncated = true;
+    out.warnings.push(format!("only the first {MAX_IMPORT_DESCRIPTORS} bound import descriptors were read"));
 }
 
 /// Read the import, delay-load and bound import directories.
 pub fn import_table(data: &[u8], h: &PeHeaders) -> ImportTable {
+    import_table_with_text_limit(data, h, DEFAULT_MAX_TABLE_TEXT_BYTES)
+}
+
+/// Read imports with one retained-string byte budget shared by normal, delay and bound imports.
+/// The budget counts decoded UTF-8 bytes, including repeated library names and forwarders.
+pub fn import_table_with_text_limit(data: &[u8], h: &PeHeaders, max_text_bytes: usize) -> ImportTable {
     let mut out = ImportTable::default();
-    normal_imports(data, h, &mut out);
-    delay_imports(data, h, &mut out);
-    bound_modules(data, h, &mut out);
+    let mut budget = TableTextBudget::new(max_text_bytes);
+    normal_imports(data, h, &mut out, &mut budget);
+    delay_imports(data, h, &mut out, &mut budget);
+    bound_modules(data, h, &mut out, &mut budget);
+    budget.finish(&mut out.truncated, &mut out.warnings);
     out
 }
 
@@ -415,9 +570,15 @@ pub struct ExportTable {
 
 /// Read the export directory; `None` when the file has none.
 pub fn export_table(data: &[u8], h: &PeHeaders) -> Option<ExportTable> {
+    export_table_with_text_limit(data, h, DEFAULT_MAX_TABLE_TEXT_BYTES)
+}
+
+/// Read exports within a decoded-name byte budget, counting the DLL name and every alias copy.
+pub fn export_table_with_text_limit(data: &[u8], h: &PeHeaders, max_text_bytes: usize) -> Option<ExportTable> {
     let (dir_rva, dir_size) = h.dir(0)?;
     let r = Reader::new(data);
     let mut out = ExportTable::default();
+    let mut budget = TableTextBudget::new(max_text_bytes);
     let Some(d) = h.rva_to_offset(dir_rva) else {
         out.warnings.push(format!("the export directory at RVA {dir_rva:#x} is outside the file"));
         out.truncated = true;
@@ -436,9 +597,14 @@ pub fn export_table(data: &[u8], h: &PeHeaders) -> Option<ExportTable> {
     out.declared_functions = nfuncs;
     out.declared_names = nnames;
     out.dll_name = h.rva_to_offset(name_rva).and_then(|o| r.cstr(o, 512));
+    if !budget.take(out.dll_name.as_ref().map_or(0, String::len)) {
+        out.dll_name = None;
+        budget.finish(&mut out.truncated, &mut out.warnings);
+        return Some(out);
+    }
 
-    // Names first: each points at a slot of the function table.
-    let mut named: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    // Keep offsets, not decoded copies: aliases can all refer to the same long string.
+    let mut named: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
     if let (Some(nt), Some(ot)) = (h.rva_to_offset(names), h.rva_to_offset(ords)) {
         let mut bad_ordinal = 0u32;
         for i in 0..(nnames as usize).min(MAX_EXPORTS) {
@@ -451,8 +617,8 @@ pub fn export_table(data: &[u8], h: &PeHeaders) -> Option<ExportTable> {
                 bad_ordinal = bad_ordinal.saturating_add(1);
                 continue;
             }
-            let Some(text) = h.rva_to_offset(n).and_then(|p| r.cstr(p, 1024)) else { continue };
-            named.entry(u32::from(o)).or_default().push(text);
+            let Some(offset) = h.rva_to_offset(n).filter(|&p| p <= data.len()) else { continue };
+            named.entry(u32::from(o)).or_default().push(offset);
         }
         if bad_ordinal > 0 {
             out.warnings.push(format!("{bad_ordinal} name(s) point past the function table"));
@@ -472,7 +638,11 @@ pub fn export_table(data: &[u8], h: &PeHeaders) -> Option<ExportTable> {
         return Some(out);
     };
     let dir_end = u64::from(dir_rva).saturating_add(u64::from(dir_size));
-    for i in 0..nfuncs {
+    if nfuncs as usize > MAX_EXPORTS {
+        out.truncated = true;
+        out.warnings.push(format!("only the first {MAX_EXPORTS} export function slots were examined"));
+    }
+    for i in 0..nfuncs.min(MAX_EXPORTS as u32) {
         if out.entries.len() >= MAX_EXPORTS {
             out.truncated = true;
             break;
@@ -491,11 +661,26 @@ pub fn export_table(data: &[u8], h: &PeHeaders) -> Option<ExportTable> {
             (u64::from(rva) >= u64::from(dir_rva) && u64::from(rva) < dir_end).then(|| h.rva_to_offset(rva).and_then(|o| r.cstr(o, 512)).unwrap_or_default());
         match named.remove(&i) {
             Some(list) => {
-                for name in list {
+                let room = MAX_EXPORTS.saturating_sub(out.entries.len());
+                if list.len() > room {
+                    out.truncated = true;
+                }
+                for offset in list.into_iter().take(room) {
+                    let Some(name) = r.cstr(offset, 1024) else { continue };
+                    if !budget.take(name.len().saturating_add(forwarder.as_ref().map_or(0, String::len))) {
+                        budget.finish(&mut out.truncated, &mut out.warnings);
+                        return Some(out);
+                    }
                     out.entries.push(PeExport { ordinal, name: Some(name), rva, forwarder: forwarder.clone() });
                 }
             }
-            None => out.entries.push(PeExport { ordinal, name: None, rva, forwarder }),
+            None => {
+                if !budget.take(forwarder.as_ref().map_or(0, String::len)) {
+                    budget.finish(&mut out.truncated, &mut out.warnings);
+                    return Some(out);
+                }
+                out.entries.push(PeExport { ordinal, name: None, rva, forwarder });
+            }
         }
     }
     Some(out)
@@ -540,27 +725,35 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
         }
     };
     b.image_base = h.image_base;
-    b.entry = if h.entry_rva != 0 { Some(h.image_base.wrapping_add(u64::from(h.entry_rva))) } else { None };
+    b.entry = if h.entry_rva != 0 { h.image_va(u64::from(h.entry_rva)) } else { None };
+    if h.entry_rva != 0 && b.entry.is_none() {
+        b.warnings.push("the PE entry point exceeds the image address space".into());
+    }
     if h.characteristics & 0x2000 != 0 {
         b.kind = "shared-library";
     }
     let r = Reader::new(data);
     // Imports (ours carry IAT slots and ordinals).
-    let imps = imports(data, &h);
-    if !imps.is_empty() {
+    let mut imps = ImportTable::default();
+    let mut import_budget = TableTextBudget::new(DEFAULT_MAX_TABLE_TEXT_BYTES);
+    normal_imports(data, &h, &mut imps, &mut import_budget);
+    if !imps.rows.is_empty() {
         b.imports.clear();
         let mut libs = BTreeSet::new();
-        for i in &imps {
+        for i in &imps.rows {
             let name = i.name.clone().unwrap_or_else(|| format!("{}#{}", i.library.trim_end_matches(".dll").trim_end_matches(".DLL"), i.ordinal.unwrap_or(0)));
             libs.insert(i.library.clone());
-            b.import_slots.push(ImportSlot { addr: i.slot_va, name: name.clone(), library: Some(i.library.clone()), kind: "slot" });
-            b.imports.push(Import { name, library: Some(i.library.clone()), ordinal: i.ordinal, slot: Some(i.slot_va) });
+            if let Some(slot) = i.slot_va {
+                b.import_slots.push(ImportSlot { addr: slot, name: name.clone(), library: Some(i.library.clone()), kind: "slot" });
+            }
+            b.imports.push(Import { name, library: Some(i.library.clone()), ordinal: i.ordinal, slot: i.slot_va });
         }
         b.libraries = libs.into_iter().collect();
     }
+    b.warnings.extend(imps.warnings);
     // Delay-loaded imports: calls go through their own slots, so they get names too.
     let mut delayed = ImportTable::default();
-    delay_imports(data, &h, &mut delayed);
+    delay_imports(data, &h, &mut delayed, &mut import_budget);
     for i in delayed.rows {
         let name = i.name.clone().unwrap_or_else(|| format!("{}#{}", i.library.trim_end_matches(".dll").trim_end_matches(".DLL"), i.ordinal.unwrap_or(0)));
         if !b.libraries.contains(&i.library) {
@@ -571,6 +764,8 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
         }
         b.imports.push(Import { name, library: Some(i.library), ordinal: i.ordinal, slot: i.slot_va });
     }
+    import_budget.finish(&mut delayed.truncated, &mut delayed.warnings);
+    b.warnings.extend(delayed.warnings);
     // Mitigations.
     let dc = h.dll_characteristics;
     b.mitigations.pie = Some(dc & 0x40 != 0);
@@ -586,8 +781,10 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
         let n = (size as usize / ent).min(MAX_UNWIND);
         for i in 0..n {
             let Some(begin) = r.u32_le(off + i * ent) else { break };
-            if begin != 0 {
-                b.function_starts.push(h.image_base.wrapping_add(u64::from(begin)));
+            if begin != 0
+                && let Some(address) = h.image_va(u64::from(begin))
+            {
+                b.function_starts.push(address);
             }
         }
     }
@@ -733,32 +930,7 @@ pub fn parse_resources(data: &[u8], max_entries: usize) -> Result<Resources, For
     let Some((rva, size)) = h.dir(2) else { return Ok(res) };
     let base = h.rva_to_offset(rva).ok_or_else(|| FormatError::Malformed("resource directory is not in the file".into()))?;
     let available = data.get(base..).ok_or_else(|| FormatError::Truncated("resource directory".into()))?;
-    // Keep resource metadata inside the initial RVA mapping.
-    let next_section_distance = |count: usize| {
-        h.sections
-            .iter()
-            .take(count)
-            .filter(|s| s.virtual_size.max(s.raw_size) > 0)
-            .filter_map(|s| s.rva.checked_sub(rva))
-            .filter(|&distance| distance > 0)
-            .min()
-            .unwrap_or(u32::MAX)
-    };
-    let mapped_len = match h.sections.iter().enumerate().find(|(_, s)| rva.checked_sub(s.rva).is_some_and(|delta| delta < s.virtual_size.max(s.raw_size))) {
-        Some((index, s)) => rva.checked_sub(s.rva).and_then(|delta| s.raw_size.checked_sub(delta)).map(|len| len.min(next_section_distance(index))),
-        None => {
-            let first = h.sections.iter().map(|s| s.raw_offset).filter(|&o| o > 0).min().unwrap_or(u32::MAX);
-            first.checked_sub(rva).map(|len| len.min(next_section_distance(h.sections.len())))
-        }
-    }
-    .map(u64::from)
-    .and_then(|len| {
-        let address_end = u64::from(u32::MAX) + 1;
-        let remaining_rvas = address_end.checked_sub(u64::from(rva))?;
-        let remaining_offsets = address_end.checked_sub(u64::try_from(base).ok()?)?;
-        usize::try_from(len.min(remaining_rvas).min(remaining_offsets)).ok()
-    })
-    .ok_or_else(|| FormatError::Malformed("resource directory is not in the file".into()))?;
+    let mapped_len = h.rva_file_len(rva).ok_or_else(|| FormatError::Malformed("resource directory is not in the file".into()))?;
     if size as usize > available.len() {
         res.warnings.push("resource directory runs past the end of the file; reading the available bytes".into());
     }
@@ -885,6 +1057,16 @@ fn align4(x: usize) -> usize {
     x.saturating_add(3) & !3
 }
 
+/// The offset of a child version node after `value_bytes` of value, when one is present rather
+/// than only alignment padding.
+fn version_child_start(r: &Reader<'_>, value_off: usize, value_bytes: usize, node_end: usize) -> Option<usize> {
+    let start = align4(value_off.saturating_add(value_bytes));
+    let len = r.u16_le(start)?;
+    (len >= 6 && start.checked_add(usize::from(len)).is_some_and(|end| end <= node_end)).then_some(start)
+}
+
+/// Read the version nodes between `start` and `end` into `info`: the fixed file and product
+/// versions, then each string. `depth` counts levels below VS_VERSION_INFO, so strings are at 3.
 fn walk_version(r: &Reader<'_>, start: usize, end: usize, depth: u8, info: &mut VersionInfo) {
     if depth > 6 {
         return;
@@ -914,22 +1096,45 @@ fn walk_version(r: &Reader<'_>, start: usize, end: usize, depth: u8, info: &mut 
         let value_bytes = if is_text { value_len * 2 } else { value_len };
         match key.as_str() {
             "VS_VERSION_INFO" => {
-                if r.u32_le(value_off) == Some(0xfeef_04bd) {
+                // The fixed record is 13 DWORDs. Adjacent children or bytes after this node
+                // cannot supply fields missing from its declared binary value.
+                let fixed = r
+                    .slice(value_off, value_len)
+                    .filter(|_| r.u16_le(pos + 4) == Some(0) && value_len >= 52 && value_off.checked_add(value_len).is_some_and(|end| end <= node_end))
+                    .map(Reader::new);
+                if let Some(fixed) = fixed.filter(|fixed| fixed.u32_le(0) == Some(0xfeef_04bd)) {
                     let v = |ms: Option<u32>, ls: Option<u32>| -> Option<String> {
                         let (ms, ls) = (ms?, ls?);
                         Some(format!("{}.{}.{}.{}", ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff))
                     };
-                    info.file_version = v(r.u32_le(value_off + 8), r.u32_le(value_off + 12));
-                    info.product_version = v(r.u32_le(value_off + 16), r.u32_le(value_off + 20));
+                    info.file_version = v(fixed.u32_le(8), fixed.u32_le(12));
+                    info.product_version = v(fixed.u32_le(16), fixed.u32_le(20));
                 }
                 walk_version(r, align4(value_off + value_bytes), node_end, depth + 1, info);
             }
             "StringFileInfo" => walk_version(r, align4(value_off + value_bytes), node_end, depth + 1, info),
             "VarFileInfo" => {}
+            // A string with an empty value stores no value at all (wValueLength 0), as
+            // OleSelfRegister does. Strings sit right under a string table, one level below it;
+            // a leaf deeper down is inside another node's value. A value read earlier is kept.
+            _ if depth == 3 && !key.is_empty() && is_text && value_len == 0 && value_off >= node_end => {
+                info.strings.entry(key).or_default();
+            }
             _ if depth >= 2 && is_text && value_len > 0 => {
                 let units = value_len.min((node_end.saturating_sub(value_off)) / 2);
                 let v = utf16_at(r, value_off, units).unwrap_or_default();
                 info.strings.insert(key, v.trim_end_matches('\0').to_string());
+            }
+            // Some linkers write a string with wType 0; its value is still UTF-16LE. A child
+            // node after the value means this is a container, not a string.
+            _ if depth >= 2 && !is_text && !key.is_empty() && value_len > 0 => {
+                if let Some(child) = version_child_start(r, value_off, value_len, node_end) {
+                    walk_version(r, child, node_end, depth + 1, info);
+                } else if depth == 3 {
+                    let units = (value_len / 2).min((node_end.saturating_sub(value_off)) / 2);
+                    let v = utf16_at(r, value_off, units).unwrap_or_default();
+                    info.strings.insert(key, v.trim_end_matches('\0').to_string());
+                }
             }
             _ => walk_version(r, align4(value_off + value_bytes), node_end, depth + 1, info),
         }
@@ -944,6 +1149,22 @@ fn walk_version(r: &Reader<'_>, start: usize, end: usize, depth: u8, info: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_rvas_stop_before_file_padding() {
+        let mut pe = craft_anything_testkit::pe64();
+        let first = headers(&pe).unwrap().sections[0].raw_offset;
+        let opt = Reader::new(&pe).u32_le(0x3c).unwrap() as usize + 24;
+        let size_headers = 0x200_u32;
+        pe[opt + 60..opt + 64].copy_from_slice(&size_headers.to_le_bytes());
+        let coff = opt - 20;
+        let section = opt + usize::from(Reader::new(&pe).u16_le(coff + 16).unwrap());
+        pe[section + 20..section + 24].copy_from_slice(&(first + 0x400).to_le_bytes());
+        let h = headers(&pe).unwrap();
+        assert_eq!(h.rva_to_offset(size_headers - 1), Some(0x1ff));
+        assert_eq!(h.rva_to_offset(size_headers), None);
+        assert_eq!(h.rva_to_offset(h.sections[0].rva), Some((first + 0x400) as usize));
+    }
 
     #[test]
     fn imports_carry_iat_slots() {

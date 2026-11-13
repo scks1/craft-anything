@@ -6,6 +6,7 @@
 use crate::FormatError;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 
 /// Largest bytecode we analyse (16 MiB; deployed contracts are at most 24 KiB).
 pub const MAX_CODE: usize = 16 << 20;
@@ -298,6 +299,7 @@ fn cbor_arg(b: &[u8], pos: &mut usize, info: u8) -> Option<u64> {
     }
 }
 
+/// Decode one bounded metadata item. An incomplete or unsupported value invalidates the metadata trailer.
 fn cbor_item(b: &[u8], pos: &mut usize, depth: u32) -> Option<Value> {
     if depth > 4 {
         return None;
@@ -312,30 +314,40 @@ fn cbor_item(b: &[u8], pos: &mut usize, depth: u32) -> Option<Value> {
             let n = usize::try_from(cbor_arg(b, pos, info)?).ok()?;
             let s = b.get(*pos..pos.checked_add(n)?)?;
             *pos += n;
-            Some(if major == 3 { Value::from(String::from_utf8_lossy(s).into_owned()) } else { Value::from(bytes_value(s)) })
+            Some(if major == 3 { Value::from(std::str::from_utf8(s).ok()?) } else { Value::from(bytes_value(s)) })
         }
         4 => {
-            let n = usize::try_from(cbor_arg(b, pos, info)?).ok()?.min(64);
+            let n = usize::try_from(cbor_arg(b, pos, info)?).ok()?;
+            if n > 64 {
+                return None;
+            }
             let mut items = Vec::new();
             for _ in 0..n {
                 items.push(cbor_item(b, pos, depth + 1)?);
             }
-            // A version array like [0, 3, 10] reads as "0.3.10".
-            if items.len() == 3 && items.iter().all(Value::is_u64) {
-                return Some(Value::from(items.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(".")));
-            }
             Some(Value::Array(items))
         }
         5 => {
-            let n = usize::try_from(cbor_arg(b, pos, info)?).ok()?.min(32);
+            let n = usize::try_from(cbor_arg(b, pos, info)?).ok()?;
+            if n > 32 {
+                return None;
+            }
             let mut m = Map::new();
             for _ in 0..n {
-                let k = match cbor_item(b, pos, depth + 1)? {
-                    Value::String(s) => s,
-                    other => other.to_string(),
-                };
+                // The metadata view uses JSON object keys. Coercing other CBOR key
+                // types to strings can merge distinct keys and hide bytecode.
+                if b.get(*pos).map(|byte| byte >> 5) != Some(3) {
+                    return None;
+                }
+                let Value::String(k) = cbor_item(b, pos, depth + 1)? else { return None };
+                if m.contains_key(&k) {
+                    return None;
+                }
                 let v = cbor_item(b, pos, depth + 1)?;
                 let v = match (k.as_str(), &v) {
+                    ("solc" | "vyper", Value::Array(items)) if items.len() == 3 && items.iter().all(Value::is_u64) => {
+                        Value::from(items.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("."))
+                    }
                     ("solc", Value::String(s)) if s.starts_with("0x") && s.len() == 8 => {
                         let d: Vec<u8> = (0..3).filter_map(|i| u8::from_str_radix(s.get(2 + 2 * i..4 + 2 * i)?, 16).ok()).collect();
                         if let [a, bb, c] = d.as_slice() { Value::from(format!("{a}.{bb}.{c}")) } else { v }
@@ -421,7 +433,14 @@ pub fn analyze(code: &[u8]) -> Result<EvmInterface, FormatError> {
             let Some(n) = at(k + d) else { break };
             let kind = match n.op {
                 0x60 if imm(body, n) == [0xe0] && op_at(k + d + 1) == Some(0x1c) => Some("shr-224"),
-                0x7c if imm(body, n).first() == Some(&1) && imm(body, n).iter().skip(1).all(|&b| b == 0) => Some("div-2^224"),
+                0x7c if d == 1
+                    && imm(body, n).first() == Some(&1)
+                    && imm(body, n).iter().skip(1).all(|&b| b == 0)
+                    && op_at(k + d + 1) == Some(0x90)
+                    && op_at(k + d + 2) == Some(0x04) =>
+                {
+                    Some("div-2^224")
+                }
                 0x63 if imm(body, n) == [0xff, 0xff, 0xff, 0xff] && (op_at(k + d + 1) == Some(0x16) || op_at(k + d + 2) == Some(0x16)) => Some("and-mask"),
                 _ => None,
             };
@@ -439,10 +458,16 @@ pub fn analyze(code: &[u8]) -> Result<EvmInterface, FormatError> {
         warnings.push("no selector extraction (CALLDATALOAD then SHR/DIV/AND) was seen; matches below are less certain".into());
     }
 
-    // CALLVALUE check before the dispatcher: CALLVALUE DUP1 ISZERO PUSH JUMPI.
-    let callvalue_before = ins.iter().take(disp_start).any(|i| i.op == 0x34);
+    // Only a guard on the straight-line entry path can apply to every selector.
+    let callvalue_before = ins
+        .iter()
+        .take(disp_start)
+        .enumerate()
+        .take_while(|(_, i)| !matches!(i.op, 0x00 | 0x56 | 0x57 | 0xf3 | 0xfd | 0xfe | 0xff))
+        .any(|(k, i)| i.op == 0x34 && rejects_value(body, &ins, k, &index_of));
 
     let mut functions: Vec<EvmFunction> = Vec::new();
+    let mut selectors = BTreeSet::new();
     let mut splits = 0usize;
     let mut last_jumpi: Option<usize> = None;
     let mut solc_like = 0usize;
@@ -480,13 +505,15 @@ pub fn analyze(code: &[u8]) -> Result<EvmInterface, FormatError> {
             }
         } else if n == 4 {
             // Vyper also loads the selector from memory: PUSH sel, PUSH1 0, MLOAD, EQ, ISZERO …
-            for d in 1..=3 {
-                if op_at(k + d) == Some(0x14) && op_at(k + d + 1) == Some(0x15) && found(k + d + 2).is_some() {
-                    if let Some(next) = at(k + d + 4) {
-                        hit = Some((next.off, k + d + 3, "eq-iszero-fallthrough"));
-                    }
-                    break;
-                }
+            let load = at(k + 1).is_some_and(|p| (p.op == 0x5f || is_push(p.op)) && imm_u64(body, p) == Some(0));
+            if load
+                && op_at(k + 2) == Some(0x51)
+                && op_at(k + 3) == Some(0x14)
+                && op_at(k + 4) == Some(0x15)
+                && found(k + 5).is_some()
+                && let Some(next) = at(k + 7)
+            {
+                hit = Some((next.off, k + 6, "eq-iszero-fallthrough"));
             }
             let direct = matches!(op_at(k + 1), Some(0x10 | 0x11)) && found(k + 2).is_some();
             let via_dup = matches!(op_at(k + 1), Some(0x80..=0x8f)) && matches!(op_at(k + 2), Some(0x10 | 0x11)) && found(k + 3).is_some();
@@ -498,10 +525,10 @@ pub fn analyze(code: &[u8]) -> Result<EvmInterface, FormatError> {
         if n < 4 && extraction.is_none() {
             continue;
         }
-        let selector = format!("0x{sel:08x}");
-        if functions.iter().any(|f| f.selector == selector) {
+        if !selectors.insert(sel) {
             continue;
         }
+        let selector = format!("0x{sel:08x}");
         if pattern == "eq-jumpi" {
             solc_like += 1;
         } else {
@@ -510,7 +537,9 @@ pub fn analyze(code: &[u8]) -> Result<EvmInterface, FormatError> {
         last_jumpi = Some(jumpi_k);
         let di = index_of(dest);
         let jumpdest_valid = pattern != "eq-jumpi" || di.and_then(at).is_some_and(|x| x.op == 0x5b);
-        let (mutability, reason) = if callvalue_before {
+        let (mutability, reason) = if !jumpdest_valid {
+            ("unknown", "the destination is not a JUMPDEST".to_owned())
+        } else if callvalue_before {
             ("nonpayable", "a CALLVALUE check runs before the dispatcher, so every function refuses payments".to_string())
         } else {
             match di {
@@ -548,10 +577,11 @@ pub fn analyze(code: &[u8]) -> Result<EvmInterface, FormatError> {
         if op_at(k + 1) == Some(0x15) && at(k + 2).is_some_and(|p| is_push(p.op)) && op_at(k + 3) == Some(0x57) {
             receive = "present";
         }
-        let lt = (1..=3).find(|d| op_at(k + d) == Some(0x10));
-        if let Some(d) = lt
-            && at(k + d + 1).is_some_and(|p| is_push(p.op))
-            && op_at(k + d + 2) == Some(0x57)
+        // LT pops the size first in PUSH 4, CALLDATASIZE, LT.
+        if k.checked_sub(1).and_then(at).is_some_and(|p| is_push(p.op) && imm_u64(body, p) == Some(4))
+            && op_at(k + 1) == Some(0x10)
+            && at(k + 2).is_some_and(|p| is_push(p.op))
+            && op_at(k + 3) == Some(0x57)
         {
             short_calldata = true;
         }
@@ -613,7 +643,7 @@ fn payability(code: &[u8], ins: &[Ins], start: usize, index_of: &dyn Fn(usize) -
     for _ in 0..48 {
         let Some(i) = ins.get(k) else { break };
         match i.op {
-            0x34 => return ("nonpayable", format!("checks CALLVALUE at {:#x}", i.off)),
+            0x34 if rejects_value(code, ins, k, index_of) => return ("nonpayable", format!("rejects nonzero CALLVALUE at {:#x}", i.off)),
             0x56 => {
                 let target = k.checked_sub(1).and_then(|p| ins.get(p)).filter(|p| is_push(p.op)).and_then(|p| imm_u64(code, p));
                 match target.and_then(|t| index_of(usize::try_from(t).ok()?)) {
@@ -626,7 +656,8 @@ fn payability(code: &[u8], ins: &[Ins], start: usize, index_of: &dyn Fn(usize) -
                 }
             }
             0x57 => return ("unknown", "branches before any CALLVALUE check".into()),
-            0x00 | 0xf3 | 0xfd | 0xfe | 0xff | 0x35 | 0x37 | 0x54 | 0x55 | 0xf1 | 0xf4 | 0xfa | 0xa0..=0xa4 => {
+            0xfd | 0xfe => return ("unknown", "halts with an error before any CALLVALUE check".into()),
+            0x00 | 0xf3 | 0xff | 0x35 | 0x37 | 0x54 | 0x55 | 0xf1 | 0xf4 | 0xfa | 0xa0..=0xa4 => {
                 return ("payable", format!("reaches {} at {:#x} without a CALLVALUE check", mnemonic(i.op), i.off));
             }
             _ => {}
@@ -634,6 +665,26 @@ fn payability(code: &[u8], ins: &[Ins], start: usize, index_of: &dyn Fn(usize) -
         k += 1;
     }
     ("unknown", "no CALLVALUE check in the first instructions".into())
+}
+
+/// CALLVALUE only reads the payment. Recognize a direct test that sends the nonzero path
+/// to a rejection, allowing the common DUP1 that preserves the original value for cleanup.
+fn rejects_value(code: &[u8], ins: &[Ins], k: usize, index_of: &dyn Fn(usize) -> Option<usize>) -> bool {
+    let mut next = k + 1;
+    if ins.get(next).is_some_and(|i| i.op == 0x80) {
+        next += 1;
+    }
+    let jumps_when_zero = ins.get(next).is_some_and(|i| i.op == 0x15);
+    next += usize::from(jumps_when_zero);
+    let Some(push) = ins.get(next).filter(|i| is_push(i.op)) else { return false };
+    if ins.get(next + 1).is_none_or(|i| i.op != 0x57) {
+        return false;
+    }
+    let Some(target) = imm_u64(code, push).and_then(|v| usize::try_from(v).ok()).and_then(index_of) else { return false };
+    if ins.get(target).is_none_or(|i| i.op != 0x5b) {
+        return false;
+    }
+    reverts_soon(code, ins, if jumps_when_zero { next + 2 } else { target }, index_of)
 }
 
 fn reverts_soon(code: &[u8], ins: &[Ins], mut k: usize, index_of: &dyn Fn(usize) -> Option<usize>) -> bool {
@@ -665,6 +716,26 @@ fn reverts_soon(code: &[u8], ins: &[Ins], mut k: usize, index_of: &dyn Fn(usize)
 mod tests {
     use super::*;
     use craft_anything_testkit::formats as fx;
+
+    /// A plausible trailer length alone must not remove instructions from the analyzed bytecode.
+    #[test]
+    fn incomplete_cbor_must_not_shorten_the_analyzed_contract() {
+        // A nested array declares 65 integers but supplies just 64. The top-level map
+        // and its length suffix otherwise look complete.
+        let mut short = vec![0xa1, 0x61, b'x', 0x98, 65];
+        short.extend([0; 64]);
+        let mut short_map = vec![0xa1, 0x61, b'x', 0xb8, 33];
+        for key in 0..32 {
+            short_map.extend([0x18, key, 0]);
+        }
+        for cbor in [short, short_map, vec![0xa1, 0x61, b'x', 0x61, 0xff]] {
+            let mut code = vec![0x00];
+            code.extend(&cbor);
+            code.extend((cbor.len() as u16).to_be_bytes());
+            assert!(split_metadata(&code).1.is_none());
+            assert_eq!(analyze(&code).unwrap().analysed_size, code.len());
+        }
+    }
 
     #[test]
     fn dispatcher_selectors_and_metadata() {
@@ -713,7 +784,32 @@ mod tests {
         assert_eq!(r.style, "vyper-like");
         assert_eq!(r.functions[0].selector, "0x12345678");
         assert_eq!(r.functions[0].bytecode_offset, body);
-        assert_eq!(r.functions[0].mutability, "nonpayable");
+        assert_eq!(r.functions[0].mutability, "payable", "ISZERO followed by STOP never rejects payment");
+    }
+
+    #[test]
+    fn nonpayable_needs_a_rejecting_nonzero_branch() {
+        fn dispatch(prefix: &[u8]) -> EvmInterface {
+            let mut code = prefix.to_vec();
+            code.extend([0x5f, 0x35, 0x60, 0xe0, 0x1c, 0x63, 1, 2, 3, 4, 0x14, 0x60]);
+            code.extend([(code.len() + 3) as u8, 0x57, 0x00, 0x5b, 0x00]);
+            analyze(&code).unwrap()
+        }
+        let read_only = dispatch(&[0x34, 0x50]); // CALLVALUE POP
+        assert!(!read_only.callvalue_check_before_dispatch);
+        assert_eq!(read_only.functions[0].mutability, "payable");
+        let guard = dispatch(&[0x34, 0x80, 0x15, 0x60, 9, 0x57, 0x5f, 0x80, 0xfd, 0x5b, 0x50]);
+        assert!(guard.callvalue_check_before_dispatch);
+        assert_eq!(guard.functions[0].mutability, "nonpayable");
+        // The other common form jumps to REVERT for a nonzero value and otherwise skips it.
+        let direct = dispatch(&[0x34, 0x60, 7, 0x57, 0x60, 11, 0x56, 0x5b, 0x5f, 0x80, 0xfd, 0x5b]);
+        assert!(direct.callvalue_check_before_dispatch);
+        // Reversing that conditional rejects zero-value calls, not payments.
+        let reversed = dispatch(&[0x34, 0x15, 0x60, 8, 0x57, 0x60, 12, 0x56, 0x5b, 0x5f, 0x80, 0xfd, 0x5b]);
+        assert!(!reversed.callvalue_check_before_dispatch);
+        // An unconditional jump bypasses the otherwise valid guard before the dispatcher.
+        let bypassed = dispatch(&[0x60, 12, 0x56, 0x34, 0x80, 0x15, 0x60, 12, 0x57, 0x5f, 0x80, 0xfd, 0x5b]);
+        assert!(!bypassed.callvalue_check_before_dispatch);
     }
 
     #[test]

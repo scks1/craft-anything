@@ -31,12 +31,31 @@ pub const ACP_AGENTS: &[(&str, &[&str])] = &[
     ("hermes", &["acp"]),
     ("maki", &["acp"]),
     ("copilot", &["--acp", "--stdio"]),
+    // Flags that belong to this mode (`--model`, `--no-leader`) go between `agent` and `stdio`.
+    ("grok", &["agent"]),
+    ("devin", &["acp"]),
 ];
 
 /// Agents whose ACP mode takes the backend's model (`cli_model`), and the flag after the ACP
 /// arguments that picks it. Others keep the model they're set to.
-pub const ACP_MODEL_FLAGS: &[(&str, &str)] = &[("maki", "-m")];
+pub const ACP_MODEL_FLAGS: &[(&str, &str)] = &[("maki", "-m"), ("grok", "--model"), ("devin", "--model")];
 
+/// Agents that ask the host to `authenticate` before a session opens, and the `authMethods` id
+/// the backend's stored key is sent under (`meta.api_key`). Other agents go straight to
+/// `session/new` — a stored key is never sent under an id the table doesn't list.
+pub const ACP_KEY_AGENTS: &[(&str, &str)] = &[("devin", "devin-browser")];
+
+/// The `authMethods` id the stored key authenticates with for this agent, if it is one the host
+/// supplies a key for.
+pub fn key_auth_method(agent: &str) -> Option<&'static str> {
+    ACP_KEY_AGENTS.iter().find(|(name, _)| *name == agent).map(|(_, method)| *method)
+}
+
+/// The backend's stored key for an agent the host authenticates (`ACP_KEY_AGENTS`); `None` for
+/// every other agent, so the keychain is never asked for a key nobody would use.
+pub fn key_for(store: &crate::KeyStore, agent: &str, backend: &str, kind: crate::BackendKind) -> Option<String> {
+    key_auth_method(agent).and_then(|_| store.resolve(backend, kind))
+}
 /// The arguments after `agent`'s ACP ones that pick `model`; none when its ACP mode isn't known
 /// to take one.
 pub fn model_args(agent: &str, model: Option<&str>) -> Vec<String> {
@@ -114,8 +133,12 @@ fn policy_action(call: &Value) -> (String, Value) {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Pending {
     Initialize,
+    Authenticate,
     NewSession,
     LoadSession,
+    /// `session/set_config_option`. The session is not ready until these finish: model discovery
+    /// waits on `ready`, and some agents replace the CLI's model flag when the session opens.
+    SetConfig,
     Prompt,
 }
 
@@ -127,6 +150,8 @@ struct QueuedPrompt {
 /// The ACP protocol for one conversation.
 pub struct AcpCore {
     backend: String,
+    /// The agent id (`devin`), for [`key_auth_method`] checks.
+    agent: String,
     agent_name: String,
     cwd: PathBuf,
     mcp: McpCommand,
@@ -153,12 +178,30 @@ pub struct AcpCore {
     models: Vec<String>,
     current_model: String,
     config_options: Vec<Value>,
+    /// `(configId, value)` applied in order after the session opens, before it is ready.
+    config_queue: VecDeque<(String, String)>,
+    /// A loaded session already has history. Set when the session response arrives, and copied
+    /// onto [`session_has_history`](Self::session_has_history) once the config queue is done.
+    opened_with_history: bool,
+    /// The adapter asked for `"type": "stdio"` on our MCP server. Off for every other agent.
+    typed_mcp: bool,
+    /// The backend's stored key and the `authMethods` id it authenticates with
+    /// (`ACP_KEY_AGENTS`), for an agent that asks the host to `authenticate` before a session
+    /// opens (Devin needs it; its own CLI sign-in doesn't count). `None` for every other agent,
+    /// so a stored key is never sent under a method that doesn't take one.
+    auth: Option<(String, String)>,
+    /// `agentCapabilities.loadSession` from `initialize`, kept for after `authenticate`.
+    can_load: bool,
+    /// The saved session a builder's turn was to continue couldn't be had, so the run starts a
+    /// new one from the brief instead ([`crate::Conversation::session_lost`]).
+    lost: bool,
 }
 
 impl AcpCore {
-    pub fn new(backend: &str, agent_name: &str, cwd: PathBuf, mcp: McpCommand, resume: Option<String>) -> Self {
+    pub fn new(backend: &str, agent: &str, agent_name: &str, cwd: PathBuf, mcp: McpCommand, resume: Option<String>) -> Self {
         AcpCore {
             backend: backend.into(),
+            agent: agent.into(),
             agent_name: agent_name.into(),
             cwd,
             mcp,
@@ -178,7 +221,20 @@ impl AcpCore {
             models: Vec::new(),
             current_model: String::new(),
             config_options: Vec::new(),
+            config_queue: VecDeque::new(),
+            opened_with_history: false,
+            typed_mcp: false,
+            auth: None,
+            can_load: false,
+            lost: false,
         }
+    }
+
+    /// The stored key and the `authMethods` id it authenticates with (`key_auth_method`), when
+    /// this agent takes one.
+    pub fn with_auth(mut self, auth: Option<(String, String)>) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Send permission requests to an approver (a builder run) instead of the chat.
@@ -190,6 +246,11 @@ impl AcpCore {
     /// The agent's session, once it has one (to continue later with `session/load`).
     pub fn session_id(&self) -> Option<String> {
         self.session.clone()
+    }
+
+    /// The session a builder's turn was to continue can't be had ([`crate::Conversation::session_lost`]).
+    pub fn lost(&self) -> bool {
+        self.lost
     }
 
     fn request(&mut self, method: &str, params: Value, kind: Pending) -> Out {
@@ -236,7 +297,68 @@ impl AcpCore {
     }
 
     fn mcp_servers(&self) -> Value {
-        if self.question { json!([]) } else { json!([{"name": super::MCP_NAME, "command": self.mcp.command, "args": self.mcp.args, "env": []}]) }
+        // Questions attach no server. `"type": "stdio"` is only added for an adapter that
+        // requires it (Grok). Other agents keep the payload their sessions already accept.
+        if self.question {
+            return json!([]);
+        }
+        let mut server = json!({"name": super::MCP_NAME, "command": self.mcp.command, "args": self.mcp.args, "env": []});
+        if self.typed_mcp {
+            server["type"] = json!("stdio");
+        }
+        json!([server])
+    }
+
+    /// The current string value of a session config option, when the agent reports one.
+    fn config_current(options: &[Value], id: &str) -> Option<String> {
+        let option = options.iter().find(|option| option.get("id").and_then(Value::as_str) == Some(id))?;
+        match option.get("currentValue") {
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(value) => value.get("value").and_then(Value::as_str).map(str::to_string),
+            None => None,
+        }
+    }
+
+    /// Send the next config override that the session does not already have, then mark it ready.
+    /// A value is a JSON string: Grok rejects a nested `{"value": ...}` wrapper.
+    fn advance_config(&mut self) -> Vec<Out> {
+        while let Some((id, value)) = self.config_queue.front().cloned() {
+            if Self::config_current(&self.config_options, &id).as_deref() == Some(value.as_str()) {
+                self.config_queue.pop_front();
+                continue;
+            }
+            let Some(sid) = self.session.clone() else {
+                return self.fail(format!("{} started no session", self.agent_name), None);
+            };
+            let params = json!({"sessionId": sid, "configId": id, "value": value});
+            return vec![self.request("session/set_config_option", params, Pending::SetConfig)];
+        }
+        self.ready = true;
+        self.session_has_history = self.opened_with_history;
+        self.flush()
+    }
+
+    /// `session/load` for a saved session the agent can take back, else `session/new`.
+    fn open_session(&mut self) -> Vec<Out> {
+        match self.resume.clone().filter(|_| self.can_load) {
+            Some(sid) => {
+                self.session = Some(sid.clone());
+                let params = json!({"sessionId": sid, "cwd": self.cwd, "mcpServers": self.mcp_servers()});
+                vec![self.request("session/load", params, Pending::LoadSession)]
+            }
+            None => {
+                // A builder's saved session the agent can't take back would get a follow-up
+                // with none of the build in it: fail the turn marked lost, and the run starts
+                // its new session from the brief. A chat still continues with a fresh session.
+                if self.resume.is_some() && self.decides {
+                    self.resume = None;
+                    self.lost = true;
+                    return self.fail(format!("{} can't continue its saved conversation.", self.agent_name), None);
+                }
+                let params = json!({"cwd": self.cwd, "mcpServers": self.mcp_servers()});
+                vec![self.request("session/new", params, Pending::NewSession)]
+            }
+        }
     }
 
     /// One line from the agent.
@@ -269,10 +391,16 @@ impl AcpCore {
         let Some(kind) = self.pending.remove(&id) else { return Vec::new() };
         if let Some(err) = msg.get("error") {
             let text = err.get("message").and_then(Value::as_str).unwrap_or("an error");
-            // A session that can't be continued starts afresh rather than failing the message.
+            // A session that can't be continued starts afresh rather than failing the message —
+            // unless a builder's resume was refused: then the turn fails marked lost and the run
+            // sends the brief to a new session, not a follow-up to an empty one.
             if kind == Pending::LoadSession {
                 self.resume = None;
                 self.session = None;
+                if self.decides {
+                    self.lost = true;
+                    return self.fail(format!("{} can't continue its saved conversation ({text}).", self.agent_name), None);
+                }
                 let params = json!({"cwd": self.cwd, "mcpServers": self.mcp_servers()});
                 return vec![self.request("session/new", params, Pending::NewSession)];
             }
@@ -281,27 +409,49 @@ impl AcpCore {
                 Some(-32602..=-32600) => FailureKind::Configuration,
                 _ => FailureKind::Unknown,
             }));
-            let fix = matches!(kind, Pending::Initialize | Pending::NewSession).then(|| {
-                self.sign_in_fix.clone().unwrap_or_else(|| format!("Check that {} is installed and signed in: run it once in a terminal.", self.agent_name))
-            });
+            let fix = match kind {
+                Pending::Authenticate => Some(format!("{} refused the key: add a fresh one in Settings → AI for this backend.", self.agent_name)),
+                Pending::Initialize | Pending::NewSession => {
+                    // "Needs a stored key" guidance only for an agent that takes one, and only
+                    // when the refusal is auth: the typed failure kind first, the agent's own
+                    // words as a loose match when it doesn't use the protocol's code.
+                    let text_lower = text.to_lowercase();
+                    let auth_refusal = self.failure.is_some_and(|f| f.kind == FailureKind::Authentication)
+                        || text_lower.contains("authenticat")
+                        || text_lower.contains("api_key");
+                    if key_auth_method(&self.agent).is_some() && auth_refusal {
+                        Some(format!("{} needs an API key for ACP sessions: add one in Settings → AI for this backend.", self.agent_name))
+                    } else {
+                        Some(
+                            self.sign_in_fix
+                                .clone()
+                                .unwrap_or_else(|| format!("Check that {} is installed and signed in: run it once in a terminal.", self.agent_name)),
+                        )
+                    }
+                }
+                Pending::SetConfig => Some("Choose a model and thinking depth this agent lists, then try again.".into()),
+                Pending::LoadSession | Pending::Prompt => None,
+            };
             return self.fail(format!("{}: {text}", self.agent_name), fix);
         }
         let result = msg.get("result").unwrap_or(&Value::Null);
         match kind {
             Pending::Initialize => {
-                let can_load = result.pointer("/agentCapabilities/loadSession").and_then(Value::as_bool).unwrap_or(false);
-                match self.resume.clone().filter(|_| can_load) {
-                    Some(sid) => {
-                        self.session = Some(sid.clone());
-                        let params = json!({"sessionId": sid, "cwd": self.cwd, "mcpServers": self.mcp_servers()});
-                        vec![self.request("session/load", params, Pending::LoadSession)]
-                    }
-                    None => {
-                        let params = json!({"cwd": self.cwd, "mcpServers": self.mcp_servers()});
-                        vec![self.request("session/new", params, Pending::NewSession)]
+                self.can_load = result.pointer("/agentCapabilities/loadSession").and_then(Value::as_bool).unwrap_or(false);
+                // `authenticate` goes only to an agent that advertises the method its stored key
+                // authenticates with (`ACP_KEY_AGENTS`): a key never goes under another method,
+                // and agents that need no key auth go straight to a session, whatever they
+                // advertise.
+                if let Some((method, key)) = self.auth.clone() {
+                    let advertised = |m: &Value| m.get("id").and_then(Value::as_str) == Some(method.as_str());
+                    if result.get("authMethods").and_then(Value::as_array).is_some_and(|m| m.iter().any(advertised)) {
+                        let params = json!({"methodId": method, "meta": {"api_key": key}});
+                        return vec![self.request("authenticate", params, Pending::Authenticate)];
                     }
                 }
+                self.open_session()
             }
+            Pending::Authenticate => self.open_session(),
             Pending::NewSession | Pending::LoadSession => {
                 self.current_model = result.pointer("/models/currentModelId").and_then(Value::as_str).unwrap_or_default().to_string();
                 self.config_options = result.get("configOptions").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -321,9 +471,21 @@ impl AcpCore {
                 if self.session.is_none() {
                     return self.fail(format!("{} started no session", self.agent_name), None);
                 }
-                self.ready = true;
-                self.session_has_history = kind == Pending::LoadSession;
-                self.flush()
+                // Ready waits until the queued overrides are applied. Grok's `--model` flag does
+                // not survive `session/new`; the saved default comes back and has to be set here.
+                self.opened_with_history = kind == Pending::LoadSession;
+                self.advance_config()
+            }
+            Pending::SetConfig => {
+                if let Some(options) = result.get("configOptions").and_then(Value::as_array) {
+                    self.config_options = options.clone();
+                }
+                if let Some(model) = Self::config_current(&self.config_options, "model").filter(|model| !model.is_empty()) {
+                    self.current_model = model;
+                }
+                // One attempt. A response that does not echo the new value is not sent again.
+                self.config_queue.pop_front();
+                self.advance_config()
             }
             Pending::Prompt => {
                 let mut out = Vec::new();
@@ -528,6 +690,13 @@ pub struct AcpConversation {
     question: bool,
     /// Report invalid backend settings through the conversation before starting a child process.
     validation_error: Option<craft_anything_evidence::ToolError>,
+    /// An access mode this agent cannot hold. Cleared for model-list discovery, which sends no prompt.
+    access_error: Option<craft_anything_evidence::ToolError>,
+    /// Copied onto the core when the process starts, and applied before the session is ready.
+    session_config: Vec<(String, String)>,
+    /// The backend's stored key and its `authMethods` id, for an agent that asks the host to
+    /// `authenticate` (`ACP_KEY_AGENTS`: Devin).
+    auth: Option<(String, String)>,
 }
 
 impl AcpConversation {
@@ -546,6 +715,9 @@ impl AcpConversation {
 
     pub(crate) fn model_metadata_with_stop(mut self, timeout: Duration, stop: &Stop) -> Result<ModelMetadata, craft_anything_evidence::ToolError> {
         stop.check()?;
+        // No prompt is sent. The question-shaped session only keeps the tool server off, so a
+        // refusal of questions and Clean room does not apply to reading the model list.
+        self.access_error = None;
         self.spawn()?;
         self.busy.store(true, Ordering::SeqCst);
         let started = Instant::now();
@@ -587,6 +759,12 @@ impl AcpConversation {
         self
     }
 
+    /// Keep an access-mode refusal until the conversation starts. Model-list discovery clears it.
+    pub fn with_access_limit(mut self, result: Result<(), craft_anything_evidence::ToolError>) -> Self {
+        self.access_error = result.err();
+        self
+    }
+
     /// A read-only question: attach no MCP server and refuse permission requests. The caller
     /// must also choose a fresh session and restrictive agent flags; this switch alone doesn't
     /// prevent native tools from running without a permission request.
@@ -608,9 +786,22 @@ impl AcpConversation {
         self
     }
 
+    /// The stored key and the `authMethods` id it authenticates with (`key_auth_method`), for an
+    /// agent that asks the host to `authenticate` before a session opens.
+    pub fn with_auth(mut self, auth: Option<(String, String)>) -> Self {
+        self.auth = auth;
+        self
+    }
+
     /// Text put before each message, as the CLI runs do (who it works for, how to use our tools).
     pub fn with_preamble(mut self, preamble: String) -> Self {
         self.preamble = preamble;
+        self
+    }
+
+    /// Config options applied with `session/set_config_option` after `session/new` or `session/load`.
+    pub fn with_session_config(mut self, config: Vec<(String, String)>) -> Self {
+        self.session_config = config;
         self
     }
 
@@ -644,6 +835,9 @@ impl AcpConversation {
             failure: None,
             question: false,
             validation_error: None,
+            access_error: None,
+            session_config: Vec::new(),
+            auth: None,
         }
     }
 
@@ -653,14 +847,16 @@ impl AcpConversation {
 
     /// Start the agent and send `initialize`.
     fn spawn(&mut self) -> Result<(), craft_anything_evidence::ToolError> {
-        if let Some(error) = &self.validation_error {
-            return Err(error.clone());
+        if let Some(error) = self.validation_error.clone().or_else(|| self.access_error.clone()) {
+            return Err(error);
         }
         let name = display_for(&self.agent);
         let resume = self.lock().as_ref().and_then(|s| s.core.session_id()).or_else(|| self.resume.clone());
-        let mut core = AcpCore::new(&self.backend, &name, self.cwd.clone(), self.mcp.clone(), resume);
+        let mut core = AcpCore::new(&self.backend, &self.agent, &name, self.cwd.clone(), self.mcp.clone(), resume).with_auth(self.auth.clone());
         core.question = self.question;
         core.sign_in_fix = self.adapter.sign_in_fix();
+        core.typed_mcp = self.adapter.acp_mcp_stdio_type();
+        core.config_queue = VecDeque::from(self.session_config.clone());
         if self.approver.is_some() {
             core = core.deciding();
         }
@@ -771,6 +967,12 @@ impl Conversation for AcpConversation {
         self.lock().as_ref().and_then(|s| s.core.session_id()).or_else(|| self.resume.clone())
     }
 
+    /// A builder's saved session the agent couldn't continue (no `loadSession`, or a refused
+    /// `session/load`): the run sends the brief to the new session instead of a follow-up.
+    fn session_lost(&self) -> bool {
+        self.lock().as_ref().is_some_and(|s| s.core.lost())
+    }
+
     fn poll(&mut self) -> Vec<AgentEvent> {
         let mut events: Vec<AgentEvent> = self.rx.try_iter().collect();
         // An agent that exits mid-message would otherwise leave the conversation busy forever.
@@ -861,12 +1063,14 @@ mod tests {
 
     #[test]
     fn model_metadata_deadlines_name_the_current_agent() {
-        for (agent, name) in [("gemini-cli", "Gemini CLI"), ("copilot", "GitHub Copilot")] {
+        for (agent, name) in [("gemini-cli", "Gemini CLI"), ("copilot", "GitHub Copilot"), ("grok", "Grok Build")] {
             let mcp = McpCommand { command: "not-started".into(), args: Vec::new(), notes: None };
             let conversation = AcpConversation::new("Test", agent, "not-started".into(), Vec::new(), PathBuf::new(), mcp, None);
             let error = conversation.model_metadata_timeout();
             assert_eq!(error.message, format!("{name} did not list its models before the deadline."));
-            assert_eq!(error.remediation.unwrap().contains("copilot login"), agent == "copilot");
+            let fix = error.remediation.unwrap();
+            assert_eq!(fix.contains("copilot login"), agent == "copilot");
+            assert_eq!(fix.contains("grok login"), agent == "grok");
         }
     }
 
@@ -884,7 +1088,7 @@ mod tests {
 
     fn core(resume: Option<&str>) -> AcpCore {
         let mcp = McpCommand { command: "/opt/ca/craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
-        AcpCore::new("Gemini", "Gemini CLI", PathBuf::from("/w/project"), mcp, resume.map(str::to_string))
+        AcpCore::new("Gemini", "gemini-cli", "Gemini CLI", PathBuf::from("/w/project"), mcp, resume.map(str::to_string))
     }
 
     fn sent(outs: &[Out]) -> Vec<Value> {
@@ -907,6 +1111,7 @@ mod tests {
         assert_eq!(new[0]["method"], "session/new");
         assert_eq!(new[0]["params"]["cwd"], "/w/project");
         assert_eq!(new[0]["params"]["mcpServers"][0]["name"], "craft-anything");
+        assert!(new[0]["params"]["mcpServers"][0].get("type").is_none(), "only an adapter that asks sends type");
         assert_eq!(new[0]["params"]["mcpServers"][0]["env"], json!([]));
         let prompt = sent(&c.line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-1"}}"#));
         assert_eq!(prompt[0]["method"], "session/prompt");
@@ -928,6 +1133,110 @@ mod tests {
         assert!(matches!(events(end)[..], [AgentEvent::TurnDone { .. }]));
         // The next message goes straight out on the same session.
         assert_eq!(sent(&c.prompt("And then?"))[0]["params"]["sessionId"], "s-1");
+    }
+
+    /// An agent that advertises auth methods it doesn't need a stored key for (Gemini's OAuth)
+    /// goes straight to `session/new`: a key is never sent under another method.
+    /// The key lookup asks the store only for a `ACP_KEY_AGENTS` agent: another agent with a key
+    /// set gets `None` (no keychain read), and so does a key agent without one.
+    #[test]
+    fn key_for_resolves_only_for_key_auth_agents() {
+        let store = crate::KeyStore::file_only(std::env::temp_dir().join(format!("ca-key-for-{}.toml", std::process::id())));
+        store.set("Devin", "sk-dev").unwrap();
+        assert_eq!(key_for(&store, "devin", "Devin", crate::BackendKind::AgentCli).as_deref(), Some("sk-dev"));
+        assert!(key_for(&store, "gemini-cli", "Devin", crate::BackendKind::AgentCli).is_none(), "not a key agent: store is never asked");
+        assert!(key_for(&store, "devin", "Other", crate::BackendKind::AgentCli).is_none(), "no key stored for the backend");
+    }
+
+    #[test]
+    fn advertised_methods_without_key_auth_open_a_session() {
+        let mut c = core(None);
+        c.start();
+        let new = sent(&c.line(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"oauth-personal","name":"Log in with Google"},{"id":"api-key","name":"API key"}]}}"#,
+        ));
+        assert_eq!(new[0]["method"], "session/new", "no authenticate: this agent takes no stored key");
+    }
+
+    /// Devin advertises `devin-browser`; the backend's stored key authenticates with it before a
+    /// session opens, and a refused key ends the turn with the fix.
+    #[test]
+    fn devin_authenticates_with_the_stored_key_before_opening_a_session() {
+        let mut c = core(None).with_auth(Some(("devin-browser".into(), "sk-test".into())));
+        c.start();
+        let auth = sent(&c.line(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"devin-browser","name":"Log in with browser"}]}}"#,
+        ));
+        assert_eq!(auth[0]["method"], "authenticate");
+        assert_eq!(auth[0]["params"], json!({"methodId": "devin-browser", "meta": {"api_key": "sk-test"}}));
+        let new = sent(&c.line(r#"{"jsonrpc":"2.0","id":2,"result":null}"#));
+        assert_eq!(new[0]["method"], "session/new");
+
+        // Its method isn't advertised: no authenticate, the session is asked for and its own
+        // "not authenticated" refusal is what the run reports.
+        let mut c = core(None).with_auth(Some(("devin-browser".into(), "sk-test".into())));
+        c.start();
+        let new = sent(&c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"something-else"}]}}"#));
+        assert_eq!(new[0]["method"], "session/new");
+
+        // A refused key ends the turn and says to add a fresh one.
+        let mut c = core(None).with_auth(Some(("devin-browser".into(), "sk-test".into())));
+        c.start();
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"devin-browser"}]}}"#);
+        let ev = events(c.line(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"bad key"}}"#));
+        assert!(matches!(ev.first(), Some(AgentEvent::Error { remediation: Some(r), .. }) if r.contains("refused the key")), "{ev:?}");
+
+        // A `session/new` refusal with ACP's auth-required code gets the stored-key fix for an
+        // agent that takes one, whatever its message says ("Login required" names no key).
+        let mcp = McpCommand { command: "/opt/ca/craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
+        let mut c = AcpCore::new("Devin", "devin", "Devin", PathBuf::from("/w/project"), mcp, None).with_auth(Some(("devin-browser".into(), "sk-test".into())));
+        c.start();
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"devin-browser"}]}}"#);
+        c.line(r#"{"jsonrpc":"2.0","id":2,"result":null}"#);
+        let ev = events(c.line(r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"Login required"}}"#));
+        assert!(matches!(ev.first(), Some(AgentEvent::Error { remediation: Some(r), .. }) if r.contains("API key")), "{ev:?}");
+
+        // The same refusal for an agent that takes no stored key keeps its sign-in fix.
+        let mut c = core(None);
+        c.start();
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"oauth-personal"}]}}"#);
+        let ev = events(c.line(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}}"#));
+        assert!(matches!(ev.first(), Some(AgentEvent::Error { remediation: Some(r), .. }) if r.contains("signed in")), "{ev:?}");
+    }
+
+    /// A builder's saved session the agent can't continue (no `loadSession`, or a refused
+    /// `session/load`) fails the turn marked lost, so the run sends the brief to a new session —
+    /// a follow-up to an empty session would lack the build's context. Chats still continue with
+    /// a fresh session.
+    #[test]
+    fn a_saved_session_a_builder_cant_continue_fails_lost() {
+        // The agent doesn't take sessions back: builder fails lost, then starts fresh.
+        let mut c = core(Some("old")).deciding();
+        c.start();
+        let out = c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":false}}}"#);
+        assert!(out.contains(&Out::TurnEnded) && c.lost(), "no context-less session: {out:?}");
+        let again = sent(&c.prompt("Go"));
+        assert_eq!(again[0]["method"], "initialize");
+        let new = sent(&c.line(r#"{"jsonrpc":"2.0","id":2,"result":{"agentCapabilities":{"loadSession":false}}}"#));
+        assert_eq!(new[0]["method"], "session/new", "resume forgotten: a new session gets the brief");
+
+        // A chat with the same answer continues silently with a fresh session.
+        let mut c = core(Some("old"));
+        c.start();
+        let new = sent(&c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":false}}}"#));
+        assert_eq!(new[0]["method"], "session/new");
+
+        // A refused `session/load`: builder fails lost, chat falls back to a new session.
+        let mut c = core(Some("old")).deciding();
+        c.start();
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}"#);
+        let out = c.line(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"no such session"}}"#);
+        assert!(out.contains(&Out::TurnEnded) && c.lost(), "refused load fails lost for a builder: {out:?}");
+        let mut c = core(Some("old"));
+        c.start();
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}"#);
+        let new = sent(&c.line(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"no such session"}}"#));
+        assert_eq!(new[0]["method"], "session/new");
     }
 
     #[test]
@@ -1193,6 +1502,168 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt
         };
         let Some(c) = super::super::acp_for(&super::super::CliSpec::new(config, options, false, None)) else { panic!("Maki speaks ACP") };
         assert_eq!((c.program.as_str(), c.args.as_slice()), ("maki", &["--no-plugins", "acp", "-m", "anthropic/claude-sonnet-4-6"].map(String::from)[..]));
+        assert!(!c.adapter.acp_mcp_stdio_type());
+    }
+
+    /// Grok's server enum needs `"type": "stdio"`. A session for any other agent leaves it off,
+    /// and a question still attaches no server.
+    #[test]
+    fn only_grok_sends_a_typed_stdio_server() {
+        let mut plain = core(None);
+        plain.start();
+        let untyped = sent(&plain.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}"#));
+        assert_eq!(untyped[0]["method"], "session/new");
+        assert!(untyped[0]["params"]["mcpServers"][0].get("type").is_none());
+
+        let mut grok = core(None);
+        grok.typed_mcp = true;
+        grok.start();
+        let typed = sent(&grok.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}"#));
+        assert_eq!(typed[0]["params"]["mcpServers"][0]["type"], "stdio");
+        assert_eq!(typed[0]["params"]["mcpServers"][0]["name"], "craft-anything");
+
+        let mut question = core(None);
+        question.question = true;
+        question.typed_mcp = true;
+        question.start();
+        let asked = sent(&question.line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#));
+        assert_eq!(asked[0]["params"]["mcpServers"], json!([]));
+    }
+
+    /// `grok agent [flags] stdio`: the model flag and `--no-leader` sit between `agent` and `stdio`.
+    #[test]
+    fn a_grok_backend_runs_agent_then_its_flags_then_stdio() {
+        let options = crate::BackendOptions { cli_model: Some("grok-4.6".into()), cli_thinking: Some(crate::Effort::Low), ..Default::default() };
+        let Some(c) = super::super::acp_for(&super::super::CliSpec::new(grok_config(), options, false, None)) else { panic!("Grok speaks ACP") };
+        assert_eq!(
+            (c.program.as_str(), c.args.as_slice()),
+            ("grok", &["agent", "--model", "grok-4.6", "--no-leader", "--reasoning-effort", "low", "stdio"].map(String::from)[..])
+        );
+        assert_eq!(c.session_config, [("model".into(), "grok-4.6".into()), ("reasoning_effort".into(), "low".into())]);
+        assert!(!c.args.iter().any(|arg| arg.contains("always-approve") || arg.contains("yolo")));
+
+        let quiet = crate::BackendOptions::default();
+        let Some(plain) = super::super::acp_for(&super::super::CliSpec::new(grok_config(), quiet.clone(), false, None)) else { panic!("Grok speaks ACP") };
+        assert_eq!(plain.args, ["agent", "--no-leader", "stdio"]);
+        assert!(plain.session_config.is_empty());
+        assert!(plain.adapter.acp_mcp_stdio_type());
+        // A chat that is not deep is Clean room. Grok cannot hold that, so the run is refused
+        // before the process starts. The argv is still the one a deep build uses.
+        assert!(plain.access_error.as_ref().is_some_and(|error| error.message.contains("Clean room")));
+
+        let mut question = super::super::CliSpec::new(
+            grok_config(),
+            crate::BackendOptions { cli_model: Some("grok-4.5".into()), effort: Some(crate::Effort::Medium), ..Default::default() },
+            false,
+            None,
+        );
+        question.question = true;
+        let Some(asked) = super::super::acp_for(&question) else { panic!("Grok answers questions") };
+        assert_eq!(asked.args, ["agent", "--model", "grok-4.5", "--no-leader", "--reasoning-effort", "medium", "stdio"]);
+        assert!(asked.question);
+        assert!(asked.access_error.as_ref().is_some_and(|error| error.message.contains("question")));
+        assert_eq!(asked.session_config, [("model".into(), "grok-4.5".into()), ("reasoning_effort".into(), "medium".into())]);
+
+        // Deep chat is analysis only. Grok can still edit when it never asks, so that run is refused too.
+        let mut chat = super::super::CliSpec::new(grok_config(), crate::BackendOptions::default(), false, None);
+        chat.deep = true;
+        let Some(analyse) = super::super::acp_for(&chat) else { panic!("Grok speaks ACP") };
+        assert!(analyse.access_error.as_ref().is_some_and(|error| error.message.contains("deep chat")));
+        assert_eq!(analyse.args, ["agent", "--no-leader", "stdio"]);
+
+        let mut deep = super::super::CliSpec::new(grok_config(), quiet, false, None);
+        deep.deep = true;
+        deep.builder = Some(super::super::Builder { investigation: None, inbox: std::env::temp_dir() });
+        let Some(build) = super::super::acp_for(&deep) else { panic!("a deep build is allowed") };
+        assert!(build.access_error.is_none() && build.validation_error.is_none());
+        assert_eq!(build.args, ["agent", "--no-leader", "stdio"]);
+
+        let blocked = crate::BackendOptions { args: vec!["--always-approve".into()], ..Default::default() };
+        let Some(refused) = super::super::acp_for(&super::super::CliSpec::new(grok_config(), blocked, false, None)) else { panic!("Grok speaks ACP") };
+        assert_eq!(refused.args, ["agent", "--no-leader", "stdio"]);
+        assert!(refused.validation_error.is_some());
+
+        let mut remote = grok_config();
+        remote.ssh_host = Some("other-computer".into());
+        assert!(super::super::acp_for(&super::super::CliSpec::new(remote, crate::BackendOptions::default(), false, None)).is_none());
+        let off = crate::BackendOptions { acp: Some(false), ..Default::default() };
+        assert!(super::super::acp_for(&super::super::CliSpec::new(grok_config(), off, false, None)).is_none());
+    }
+
+    fn grok_config() -> crate::BackendConfig {
+        crate::BackendConfig { name: "Grok".into(), kind: crate::BackendKind::AgentCli, model: "grok".into(), base_url: None, ssh_host: None, enabled: true }
+    }
+
+    fn session_opened(model: &str, effort: &str) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "sessionId": "s-1",
+                "models": {"currentModelId": model, "availableModels": [{"modelId": "grok-4.7"}, {"modelId": "grok-4.6"}]},
+                "configOptions": [
+                    {"id": "model", "currentValue": model, "options": [{"value": "grok-4.7", "name": "Grok 4.7"}, {"value": "grok-4.6", "name": "Grok 4.6"}]},
+                    {"id": "reasoning_effort", "category": "thought_level", "currentValue": effort, "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    fn config_reply(id: u64, model: &str, effort: &str) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"configOptions": [
+                {"id": "model", "currentValue": model},
+                {"id": "reasoning_effort", "currentValue": effort, "options": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}
+            ]}
+        })
+        .to_string()
+    }
+
+    /// The CLI model flag does not stick after `session/new`. Overrides go out before the prompt,
+    /// a value the session already has is skipped, and the session id is kept.
+    #[test]
+    fn session_config_is_applied_before_the_prompt_and_a_matching_value_is_skipped() {
+        let mut c = core(None);
+        c.config_queue = VecDeque::from([("model".into(), "grok-4.6".into()), ("reasoning_effort".into(), "low".into())]);
+        c.prompt("Build it.");
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}"#);
+        let first = sent(&c.line(&session_opened("grok-4.7", "high")));
+        assert_eq!(first[0]["method"], "session/set_config_option");
+        assert_eq!(first[0]["params"], json!({"sessionId": "s-1", "configId": "model", "value": "grok-4.6"}));
+        assert!(!c.ready, "the picker waits until the override lands");
+        assert_eq!(c.models, ["grok-4.7", "grok-4.6"]);
+        let second = sent(&c.line(&config_reply(3, "grok-4.6", "high")));
+        assert_eq!(second[0]["params"], json!({"sessionId": "s-1", "configId": "reasoning_effort", "value": "low"}));
+        assert_eq!(c.current_model, "grok-4.6");
+        assert_eq!(c.session_id().as_deref(), Some("s-1"), "a config reply does not carry the session id");
+        let prompt = sent(&c.line(&config_reply(4, "grok-4.6", "low")));
+        assert_eq!(prompt[0]["method"], "session/prompt");
+        assert_eq!(prompt[0]["params"]["prompt"][0]["text"], "Build it.");
+        assert!(c.ready);
+        assert_eq!(c.models, ["grok-4.7", "grok-4.6"], "the session's model list stays");
+
+        let mut same = core(None);
+        same.config_queue = VecDeque::from([("model".into(), "grok-4.7".into()), ("reasoning_effort".into(), "low".into())]);
+        same.prompt("Hi");
+        same.line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        let only_effort = sent(&same.line(&session_opened("grok-4.7", "high")));
+        assert_eq!(only_effort.len(), 1);
+        assert_eq!(only_effort[0]["params"]["configId"], "reasoning_effort");
+        assert_eq!(only_effort[0]["params"]["value"], "low");
+
+        let mut failed = core(None);
+        failed.config_queue = VecDeque::from([("model".into(), "missing".into())]);
+        failed.prompt("Hi");
+        failed.line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        failed.line(&session_opened("grok-4.7", "high"));
+        let outs = failed.line(r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"unknown model"}}"#);
+        assert_eq!(failed.failure, Some(TurnFailure::new(FailureKind::Configuration)));
+        assert!(outs.contains(&Out::TurnEnded));
+        assert!(!failed.ready);
+        assert!(sent(&outs).is_empty(), "a failed override does not prompt");
     }
 
     #[test]

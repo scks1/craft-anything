@@ -3,7 +3,7 @@
 use crate::output::Format;
 use crate::{Cli, INTERRUPTED, emit, fail, make_engine, out};
 use clap::{Args, Subcommand};
-use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, BackendKind, Effort};
+use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, BackendEntry, BackendKind, BackendOptions, Effort};
 use craft_anything_evidence::ToolError;
 use serde_json::{Value, json};
 use std::io::{Read as _, Write as _};
@@ -49,9 +49,25 @@ pub enum AiCommand {
         /// Read the API key from stdin.
         #[arg(long)]
         key_stdin: bool,
+        /// Talk to this agent app over ACP (`agent_cli` kind; the agent must speak it, e.g. devin).
+        #[arg(long)]
+        acp: bool,
     },
     /// Remove a backend.
     Remove { name: String },
+    /// Show, replace or forget the key saved in the app for an API backend (the key is never printed).
+    Key {
+        name: String,
+        /// Read the new key from this environment variable.
+        #[arg(long, conflicts_with_all = ["key_stdin", "forget"])]
+        key_env: Option<String>,
+        /// Read the new key from stdin.
+        #[arg(long, conflicts_with_all = ["key_env", "forget"])]
+        key_stdin: bool,
+        /// Forget the saved key; the backend stays and the environment key is used again.
+        #[arg(long, conflicts_with_all = ["key_env", "key_stdin"])]
+        forget: bool,
+    },
     /// Turn a backend on again.
     On { name: String },
     /// Turn a backend off: nothing uses it, and it keeps its settings and key.
@@ -88,7 +104,12 @@ pub enum AiCommand {
 }
 
 fn hub(cli: &Cli) -> Result<AiHub, ToolError> {
-    Ok(AiHub::new(make_engine(cli.project.as_deref(), cli.deep_for_run())?))
+    let hub = AiHub::new(make_engine(cli.project.as_deref(), cli.deep_for_run())?);
+    // Before any command runs, while no session lock is held (#1225).
+    if let Err(e) = hub.ensure_session_id() {
+        log::warn!("couldn't save the OpenCode Go session id: {e}");
+    }
+    Ok(hub)
 }
 
 fn write_raw(s: &str) {
@@ -231,7 +252,7 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
             }
             0
         }
-        AiCommand::Add { name, kind, model, base_url, ssh_host, key_env, key_stdin } => {
+        AiCommand::Add { name, kind, model, base_url, ssh_host, key_env, key_stdin, acp } => {
             let kind: BackendKind = match serde_json::from_value(json!(kind)) {
                 Ok(k) => k,
                 Err(_) => return crate::usage_error("--kind must be one of anthropic, openai, openrouter, openai_compatible, agent_cli"),
@@ -252,7 +273,8 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
             }
             let model = model.clone().or_else(|| kind.suggested_models().first().map(|m| m.to_string())).unwrap_or_default();
             let cfg = BackendConfig { name: name.clone(), kind, model, base_url: base_url.clone(), ssh_host: ssh_host.clone(), enabled: true };
-            match hub.add_backend(cfg.clone(), key) {
+            let entry = BackendEntry { config: cfg.clone(), options: BackendOptions { acp: acp.then_some(true), ..Default::default() } };
+            match hub.add_backend_with(entry, key) {
                 Ok(()) => {
                     emit(&json!({"added": cfg}), f);
                     0
@@ -267,6 +289,38 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
             }
             Err(e) => fail(&e, f),
         },
+        AiCommand::Key { name, key_env, key_stdin, forget } => {
+            if *forget {
+                return match hub.remove_backend_key(name) {
+                    Ok(()) => {
+                        emit(&json!({"name": name, "key_saved": false, "changed": "forgotten"}), f);
+                        0
+                    }
+                    Err(e) => fail(&e, f),
+                };
+            }
+            if key_env.is_some() || *key_stdin {
+                let key = match read_key(key_env, *key_stdin) {
+                    Ok(Some(k)) => k,
+                    Ok(None) => return crate::usage_error("--key-env or --key-stdin is needed to replace a key"),
+                    Err(m) => return crate::usage_error(&m),
+                };
+                return match hub.set_backend_key(name, &key) {
+                    Ok(()) => {
+                        emit(&json!({"name": name, "key_saved": true, "changed": "replaced"}), f);
+                        0
+                    }
+                    Err(e) => fail(&e, f),
+                };
+            }
+            match hub.saved_backend_key(name) {
+                Ok(saved) => {
+                    emit(&json!({"name": name, "key_saved": saved}), f);
+                    0
+                }
+                Err(e) => fail(&e, f),
+            }
+        }
         AiCommand::On { name } | AiCommand::Off { name } => {
             let on = matches!(c, AiCommand::On { .. });
             match hub.set_enabled(name, on) {

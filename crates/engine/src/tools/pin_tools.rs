@@ -190,10 +190,13 @@ pub(crate) fn start(ctx: &mut Ctx<'_>, app: &Path, log: &Path, another: bool, la
     start_program(ctx, app, log, another, label, (program, args))
 }
 
+/// Start a program from `app` through the run list, logging to `log`. The program is made absolute
+/// first because the child runs with `app` as its working directory.
 fn start_program(ctx: &mut Ctx<'_>, app: &Path, log: &Path, another: bool, label: &str, (program, args): (PathBuf, Vec<String>)) -> Result<Value, ToolError> {
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
     }
+    let program = crate::outputs::absolute_program(&program);
     let launch = Launch::new(&program).args(&args).cwd(app).hide_console().log_to(log).label(label).remediation("Open the folder and start it by hand.");
     let (launched, quit) = match runs(ctx).open(app, launch, another)? {
         Opened::AlreadyRunning(l) => return Ok(json!({"already_running": true, "pid": l.pid(), "started": program.display().to_string()})),
@@ -248,8 +251,10 @@ fn project_pins_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     };
     let runs = runs(ctx);
     let mut out = Vec::new();
+    let mut copied_bytes = 0u64;
     for ws in &projects {
         for pin in pins::list(ws) {
+            copied_bytes = copied_bytes.saturating_add(pin.bytes);
             let running = runs.running(&pin.app_dir(ws));
             out.push(json!({
                 "project": ws.root.display().to_string(),
@@ -261,7 +266,7 @@ fn project_pins_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
             }));
         }
     }
-    Ok(ToolOutput::Value(json!({"count": out.len(), "pins": out})))
+    Ok(ToolOutput::Value(json!({"count": out.len(), "pins": out, "copied_bytes": copied_bytes})))
 }
 
 fn project_pin_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
@@ -350,6 +355,46 @@ mod tests {
         }
     }
 
+    /// A project opened by a relative folder starts its built program from an absolute path, not
+    /// from the program path applied to the workspace's working folder twice.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_project_plays_its_built_program() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = std::env::current_dir().unwrap();
+        let d = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = d.path().strip_prefix(&cwd).unwrap();
+        let ws = Workspace::create(relative, "Game", "a game", TargetRef::None).unwrap();
+        let app = ws.app_dir();
+        std::fs::create_dir_all(app.join("target/debug")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"game\"\n").unwrap();
+        let program = app.join("target/debug/game");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'played\\n'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let e = Engine::new(crate::testing::session());
+        let result =
+            e.call("project_play", json!({"project": ws.root}), CallOptions::new(Caller::Cli).with_consent(Consent::Granted)).unwrap().to_json()["result"]
+                .clone();
+        assert_eq!(result["already_running"], false);
+        assert_eq!(result["closed_at_once"]["code"], 0, "{result}");
+        assert!(std::path::Path::new(result["started"].as_str().unwrap()).is_absolute(), "{result}");
+
+        let made = e
+            .call("project_pin_create", json!({"project": ws.root}), CallOptions::new(Caller::Cli).with_consent(Consent::Granted))
+            .unwrap()
+            .to_json()["result"]
+            .clone();
+        let opened = e
+            .call("project_pin_open", json!({"project": ws.root, "pin": made["pin"]["id"]}), CallOptions::new(Caller::Cli).with_consent(Consent::Granted))
+            .unwrap()
+            .to_json()["result"]
+            .clone();
+        assert_eq!(opened["closed_at_once"]["code"], 0, "{opened}");
+        assert!(std::path::Path::new(opened["started"].as_str().unwrap()).is_absolute(), "{opened}");
+    }
+
     #[test]
     fn pin_list_rename_and_remove_from_the_cli() {
         let d = tempfile::tempdir().unwrap();
@@ -374,10 +419,11 @@ mod tests {
         assert!(pins::list(&ws).is_empty(), "an estimate pins nothing");
         let made = call("project_pin_create", json!({"project": ws.root})).unwrap();
         assert_eq!(made["pin"]["mode"], "frozen");
-        call("project_pin_create", json!({"project": ws.root, "mode": "light", "name": "Latest"})).unwrap();
+        let light = call("project_pin_create", json!({"project": ws.root, "mode": "light", "name": "Latest"})).unwrap();
 
         let list = call("project_pins_list", json!({"project": ws.root})).unwrap();
         assert_eq!(list["count"], 2);
+        assert_eq!(list["copied_bytes"], made["pin"]["bytes"].as_u64().unwrap() + light["pin"]["bytes"].as_u64().unwrap());
         assert_eq!(list["pins"][1]["pin"]["name"], "Latest");
         assert_eq!(list["pins"][0]["running"], false);
 
@@ -386,6 +432,7 @@ mod tests {
         call("project_pin_delete", json!({"project": ws.root, "pin": 1, "confirm": true})).unwrap();
         let list = call("project_pins_list", json!({"project": ws.root})).unwrap();
         assert_eq!(list["count"], 1);
+        assert_eq!(list["copied_bytes"], light["pin"]["bytes"]);
         assert_eq!(call("project_pin_open", json!({"project": ws.root, "pin": 1})).unwrap_err().code, ErrorCode::NotFound);
     }
 }

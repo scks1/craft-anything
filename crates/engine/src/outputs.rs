@@ -136,15 +136,26 @@ fn cargo_programs(app: &Path) -> Vec<String> {
     out
 }
 
+/// The program a child should start when it runs with `app` as its working directory: an
+/// app-relative file is made absolute so the working directory is not applied to it twice. A
+/// bare command name stays for PATH lookup.
+pub fn absolute_program(program: &Path) -> PathBuf {
+    if program.is_relative() && program.components().count() > 1 { crate::workspace::absolute(program) } else { program.to_path_buf() }
+}
+
 /// What "Play" starts for a finished game or app: (program, arguments), run from app/. A Godot
 /// project opens in the Godot it was built with, an Electron app in the Electron it installed.
 /// Other toolchains may declare an interpreted/runner launch when no packaged program exists.
 pub fn launch(app: &Path, godot: Option<&Path>) -> Option<(PathBuf, Vec<String>)> {
     if app.join("project.godot").is_file() {
-        return godot.map(|g| (g.to_path_buf(), vec!["--path".to_string(), app.display().to_string()]));
+        let root = std::path::absolute(app).ok()?;
+        // Godot decodes --path as UTF-8. A lossy conversion could open a different project.
+        let project = root.to_str()?;
+        return godot.map(|g| (g.to_path_buf(), vec!["--path".into(), project.into()]));
     }
     if uses_electron(app) {
-        return electron_program(app).map(|e| (e, vec![app.display().to_string()]));
+        let root = std::path::absolute(app).ok()?;
+        return electron_program(&root).map(|e| (e, vec![root.display().to_string()]));
     }
     built_program(app).or_else(|| packaged_program(&app.join("Build"))).map(|p| (p, Vec::new())).or_else(|| crate::toolchains::found_in(app)?.launch(app))
 }
@@ -241,4 +252,54 @@ pub fn is_program(p: &Path) -> bool {
 pub fn is_program(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.extension().is_none() && p.metadata().is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn godot_does_not_open_a_different_project_after_lossy_conversion() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let app = dir.path().join(std::ffi::OsStr::from_bytes(b"game-\xff"));
+        let other = dir.path().join("game-\u{fffd}");
+        for folder in [&app, &other] {
+            std::fs::create_dir(folder).unwrap();
+            std::fs::write(folder.join("project.godot"), "").unwrap();
+        }
+        let godot = Path::new("godot");
+        assert_eq!(launch(&other, Some(godot)), Some((godot.into(), vec!["--path".into(), other.to_str().unwrap().into()])));
+        assert_eq!(launch(&app, Some(godot)), None);
+    }
+
+    /// The child runs inside the project, so an app path passed to it must survive that cwd change.
+    #[test]
+    fn godot_and_electron_receive_the_full_project_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = dir.path().strip_prefix(&cwd).unwrap();
+        let root = dir.path().display().to_string();
+        let marker = relative.join("project.godot");
+        std::fs::write(&marker, "").unwrap();
+        let godot = Path::new("godot");
+        assert_eq!(launch(relative, Some(godot)), Some((godot.into(), vec!["--path".into(), root.clone()])));
+        std::fs::remove_file(marker).unwrap();
+
+        std::fs::write(relative.join("package.json"), r#"{"devDependencies":{"electron":"1"}}"#).unwrap();
+        let dist = relative.join("node_modules/electron/dist");
+        let executable = if cfg!(windows) {
+            "electron.exe"
+        } else if cfg!(target_os = "macos") {
+            "Electron.app/Contents/MacOS/Electron"
+        } else {
+            "electron"
+        };
+        let binary = dist.join(executable);
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, "").unwrap();
+        assert_eq!(launch(relative, None), Some((cwd.join(binary), vec![root])));
+    }
 }

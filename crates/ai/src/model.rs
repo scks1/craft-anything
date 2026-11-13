@@ -276,4 +276,9 @@ pub trait ChatModel: Send {
     fn endpoint(&self) -> Option<String> {
         None
     }
+    /// The context window its server says it has loaded, when it says one (see [`crate::window`]).
+    /// Asked on the agent's worker, never on the UI thread.
+    fn context_window(&self) -> Option<crate::window::Window> {
+        None
+    }
 }

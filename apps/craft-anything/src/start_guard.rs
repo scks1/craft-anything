@@ -59,9 +59,14 @@ pub fn opened(dir: &Path) {
 mod tests {
     use super::*;
 
+    /// One test at a time: they share this process's held mark, and one's `opened()` would let
+    /// go of another's lock.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
     /// #74: a start that dies before its window leaves the mark; one that opens it doesn't.
     #[test]
     fn a_start_that_never_opened_a_window_is_seen_by_the_next_one() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("config");
         assert!(!last_start_failed(&dir), "a first start has nothing to retry");
@@ -80,6 +85,7 @@ mod tests {
 
     #[test]
     fn a_folder_that_cannot_be_written_means_no_fallback_and_no_crash() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let d = tempfile::tempdir().unwrap();
         let file = d.path().join("not-a-folder");
         std::fs::write(&file, "").unwrap();

@@ -35,10 +35,23 @@ fn fake_claude(bin: &Path) -> PathBuf {
     program
 }
 
+/// A stand-in builder that answers one turn and exits, so a run that really starts finishes.
+fn fake_builder(bin: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let program = bin.join("claude");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'fake-claude 1.0'; exit 0; fi\nif [ \"$1\" = \"--help\" ]; then echo '--output-format stream-json'; exit 0; fi\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fake\"}'\nprintf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Built it.\"}]}}'\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    program
+}
+
 fn api_config(config: &Path) {
     std::fs::write(
         config.join("config.toml"),
-        "[[ai.backends]]\nname = \"API\"\nkind = \"openai_compatible\"\nmodel = \"test-model\"\nbase_url = \"http://127.0.0.1:9/v1\"\nenabled = true\n",
+        "[[ai.backends]]\nname = \"API\"\nkind = \"openai_compatible\"\nmodel = \"test-model\"\nbase_url = \"http://127.0.0.1:0/v1\"\nenabled = true\n",
     )
     .unwrap();
 }
@@ -47,7 +60,7 @@ fn api_config(config: &Path) {
 fn disabled_config(config: &Path) {
     std::fs::write(
         config.join("config.toml"),
-        "[[ai.backends]]\nname = \"Off\"\nkind = \"anthropic\"\nmodel = \"claude-test\"\nenabled = false\n\n[[ai.backends]]\nname = \"API\"\nkind = \"openai_compatible\"\nmodel = \"test-model\"\nbase_url = \"http://127.0.0.1:9/v1\"\nenabled = true\n",
+        "[[ai.backends]]\nname = \"Off\"\nkind = \"anthropic\"\nmodel = \"claude-test\"\nenabled = false\n\n[[ai.backends]]\nname = \"API\"\nkind = \"openai_compatible\"\nmodel = \"test-model\"\nbase_url = \"http://127.0.0.1:0/v1\"\nenabled = true\n",
     )
     .unwrap();
 }
@@ -217,6 +230,90 @@ fn an_invalid_command_does_not_add_an_agent() {
     assert!(!saved.contains("agent_cli"), "a refused command must not save an agent:\n{saved}");
 }
 
+/// A folder that already holds a project is attached; new-project-only options are refused and
+/// its saved builder, budget, asset setting and stack stay.
+#[test]
+fn a_new_project_option_is_refused_at_an_attached_project() {
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    let config = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    fake_claude(bin.path());
+    let parent = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(parent.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    ws.set_person(|m| {
+        m.builder = Some("Claude".into());
+        m.asset_budget_usd = 42.0;
+        m.generate_assets = true;
+    })
+    .unwrap();
+    ws.manifest.stack = "Godot".into();
+    ws.save().unwrap();
+    let root = ws.root.to_string_lossy().into_owned();
+    for (args, said) in [
+        (
+            vec!["rebuild", "-", "add a jump", "--project-folder", root.as_str(), "--build-with", "rust", "--rounds", "0", "--unattended"],
+            "--build-with is for new projects",
+        ),
+        (
+            vec!["rebuild", "-", "add a jump", "--project-folder", root.as_str(), "--generate-assets", "--rounds", "0", "--unattended"],
+            "--generate-assets is for new projects",
+        ),
+        (
+            vec!["rebuild", "-", "add a jump", "--project-folder", root.as_str(), "--existing", "edit", "--rounds", "0", "--unattended"],
+            "already holds a project",
+        ),
+    ] {
+        let out = cli(&args, config.path(), home.path(), bin.path());
+        let log = out.stderr_text();
+        assert!(!out.success, "{said}: {log}");
+        assert!(log.contains(said), "{said}: {log}");
+    }
+    let saved = Workspace::open(&ws.root).unwrap().manifest;
+    assert_eq!(saved.builder.as_deref(), Some("Claude"), "the saved builder is kept");
+    assert_eq!(saved.asset_budget_usd, 42.0, "the saved budget is kept");
+    assert!(saved.generate_assets, "the saved asset setting is kept");
+    assert_eq!(saved.stack, "Godot", "the saved stack is kept");
+}
+
+/// The success path: an attached folder keeps its settings and its typed request becomes the
+/// run's follow-up (the API has no listener, so the run fails after it starts; the feed is kept).
+#[test]
+fn an_attached_project_sends_the_request_as_a_follow_up() {
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    let config = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    api_config(config.path());
+    let parent = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(parent.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    ws.set_person(|m| {
+        m.builder = Some("Claude".into());
+        m.asset_budget_usd = 42.0;
+        m.generate_assets = true;
+    })
+    .unwrap();
+    ws.manifest.stack = "Godot".into();
+    ws.save().unwrap();
+    let out = cli(
+        &["rebuild", "-", "add a jump", "--project-folder", ws.root.to_str().unwrap(), "--backend", "API", "--rounds", "0", "--unattended"],
+        config.path(),
+        home.path(),
+        bin.path(),
+    );
+    let feed = craft_anything_engine::feed::load(&ws);
+    assert!(
+        feed.iter().any(|i| matches!(i, craft_anything_engine::feed::FeedItem::User(u) if u.text() == "add a jump")),
+        "the request is the run's follow-up:\n{}",
+        out.stderr_text()
+    );
+    let saved = Workspace::open(&ws.root).unwrap().manifest;
+    assert_eq!(saved.builder.as_deref(), Some("Claude"), "the saved builder is kept");
+    assert_eq!(saved.asset_budget_usd, 42.0, "the saved budget is kept");
+    assert!(saved.generate_assets, "the saved asset setting is kept");
+    assert_eq!(saved.stack, "Godot", "the saved stack is kept");
+}
+
 /// The guard must not stop a computer with no AI at all from finding and saving an agent.
 #[test]
 fn a_computer_with_no_ai_still_finds_an_agent() {
@@ -235,4 +332,34 @@ fn a_computer_with_no_ai_still_finds_an_agent() {
     assert!(log.contains("Using Claude Code"), "an agent must still be found when no AI is set up:\n{log}");
     let saved = std::fs::read_to_string(config.path().join("config.toml")).unwrap();
     assert!(saved.contains("agent_cli"), "the found agent must still be saved:\n{saved}");
+}
+
+/// A project whose saved builder was switched off: once the run starts, it names the saved AI
+/// and the one building instead.
+#[test]
+fn a_replaced_saved_builder_is_named_once_the_run_starts() {
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    let config = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let script = fake_builder(bin.path());
+    std::fs::write(
+        config.path().join("config.toml"),
+        format!(
+            "[[ai.backends]]\nname = \"Off\"\nkind = \"anthropic\"\nmodel = \"claude-test\"\nenabled = false\n\n[[ai.backends]]\nname = \"Claude\"\nkind = \"agent_cli\"\nmodel = \"claude-code\"\ncommand = \"{}\"\nenabled = true\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let mut ws = Workspace::create(parent.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    ws.set_person(|m| m.builder = Some("Off".into())).unwrap();
+
+    let args = stopped_run(&ws.root, None);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = cli(&refs, config.path(), home.path(), bin.path());
+    let log = out.stderr_text();
+    assert!(!out.success, "the run must stop at the empty app:\n{log}");
+    assert!(log.contains("Off") && log.contains("Claude") && log.contains("instead"), "the saved builder and its replacement must be named:\n{log}");
+    assert!(!log.contains("Using "), "a replacement is not an added agent:\n{log}");
 }

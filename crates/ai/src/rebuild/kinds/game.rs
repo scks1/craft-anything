@@ -17,15 +17,36 @@ fn starts_word(request: &str, at: usize) -> bool {
 /// A number of players as its own words: "2-player", "(four players)", but not "MPEG-2 player",
 /// "mp2 player", "12 player" or "two playerctl".
 fn says_player_count(request: &str) -> bool {
-    // Any run of spaces or line breaks counts as one space: "2  player".
-    let request = request.split_whitespace().collect::<Vec<_>>().join(" ");
     let ends_word = |rest: &str| rest.strip_prefix('s').unwrap_or(rest).chars().next().is_none_or(|c| !c.is_alphanumeric());
     ["2", "3", "4", "two", "three", "four"].iter().any(|n| {
         ["-player", " player"].iter().any(|player| {
             let phrase = format!("{n}{player}");
-            request.match_indices(&phrase).any(|(at, _)| starts_word(&request, at) && request.get(at + phrase.len()..).is_some_and(ends_word))
+            request.match_indices(&phrase).any(|(at, _)| {
+                starts_word(request, at)
+                    && request.get(..at).and_then(|before| before.split_whitespace().next_back()) != Some("mpeg")
+                    && request.get(at + phrase.len()..).is_some_and(ends_word)
+            })
         })
     })
+}
+
+/// Read weaker game cues in their own phrase. A later game cue can still win.
+fn says_play(request: &str) -> bool {
+    let request = request.split_whitespace().collect::<Vec<_>>().join(" ");
+    says_player_count(&request)
+        || request
+            .match_indices("level")
+            .any(|(at, _)| starts_word(&request, at) && !matches!(request.get(..at).and_then(|s| s.split_whitespace().next_back()), Some("low" | "high")))
+        || ["single player", "single-player", "singleplayer"].iter().any(|phrase| {
+            request.match_indices(phrase).any(|(at, _)| {
+                let rest = request.get(at + phrase.len()..).unwrap_or_default();
+                let subject = rest.strip_prefix(" app for ").or_else(|| rest.strip_prefix(" application for "));
+                let medium = subject.and_then(|s| s.split(|c: char| !c.is_alphanumeric()).next());
+                starts_word(&request, at)
+                    && rest.chars().next().is_none_or(|c| !c.is_alphanumeric())
+                    && !matches!(medium, Some("audio" | "video" | "videos" | "music" | "movies" | "films"))
+            })
+        })
 }
 
 pub struct GameKind;
@@ -56,8 +77,7 @@ impl TargetKind for GameKind {
         if game::Builder::from_stack(cx.stack).is_some() {
             Some(200)
         // Not plain "player": a video or music player is an app (#953).
-        } else if says_player_count(&cx.request)
-            || cx.request.match_indices("level").any(|(at, _)| starts_word(&cx.request, at))
+        } else if says_play(&cx.request)
             || cx.says(&[
                 "game",
                 "gameplay",
@@ -65,9 +85,6 @@ impl TargetKind for GameKind {
                 "multiplayer",
                 "multi-player",
                 "multi player",
-                "singleplayer",
-                "single-player",
-                "single player",
                 "游戏",
                 "遊戲",
                 "玩法",
@@ -80,8 +97,10 @@ impl TargetKind for GameKind {
                 " oyunu ",
                 " oyunun ",
                 " oyunlar",
+                "เกม",
             ])
             || says_game_in_spanish(cx)
+            || says_game_in_estonian(cx)
         {
             Some(60)
         } else {
@@ -125,18 +144,18 @@ impl TargetKind for GameKind {
     fn brief_sections(&self, cx: &BriefCx) -> Vec<String> {
         let target = &cx.ws.manifest.target;
         if matches!(target, TargetRef::Website { .. }) {
-            return vec![screenshot::contract(), self_test::SELF_TEST_CONTRACT.to_string()];
+            return vec![screenshot::contract(cx.sees_pictures), self_test::SELF_TEST_CONTRACT.to_string()];
         }
         // Paid, so only when the person turned it on for this project and a key is set up.
         let generated = cx.assets && cx.ws.manifest.generate_assets;
         if cx.ws.manifest.own_project() {
             return generated.then(|| assets_note(cx.ws, cx.image_model)).into_iter().collect();
         }
-        let mut s = vec![game_steps(cx.deep, cx.ghidra, matches!(target, TargetRef::Local { .. }), generated)];
+        let mut s = vec![game_steps(cx.deep, cx.ghidra, matches!(target, TargetRef::Local { .. }), generated, cx.sees_pictures)];
         if generated {
             s.push(assets_note(cx.ws, cx.image_model));
         }
-        s.push(screenshot::contract());
+        s.push(screenshot::contract(cx.sees_pictures));
         s.push(self_test::SELF_TEST_CONTRACT.to_string());
         s
     }
@@ -189,6 +208,65 @@ impl Check for CreditsCheck {
 fn says_game_in_spanish(cx: &DetectCx) -> bool {
     let tool_set = cx.says(&["juego de herramienta"]);
     (cx.says(&[" juego", " juegos"]) && !tool_set) || cx.says(&["jugabilidad", "videojuego"])
+}
+
+/// Estonian for "game" is *mäng*: its noun forms end in *mäng* or one of its case endings
+/// (*mängu*, *mängus*, *mängud*…), and compounds end the same way (*usumäng*, *lauamäng*). The
+/// verb *mängima* ("to play") and its forms begin with *mängi* (*mängiv*, *mängib*), so suffix
+/// matching keeps an app that plays music an app.
+///
+/// When the request names both a game and a website, the head of the main clause is the thing to
+/// build. The head is the last cue before the first comma (and before *nimega*, a name); a cue in
+/// a complement case marks a source or topic, not the head. So *Tee sellest mängust veebileht* is
+/// a website, while *Loo mäng nimega Veebileht* is a game.
+fn says_game_in_estonian(cx: &DetectCx) -> bool {
+    let words = main_clause_words(cx);
+    let game = last_head(&words, is_game_word);
+    let site = last_head(&words, is_site_word);
+    match (game, site) {
+        (Some(g), Some(s)) => g > s,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// The words of the request's main clause: before the first comma and before *nimega* (a name).
+fn main_clause_words<'a>(cx: &'a DetectCx) -> Vec<&'a str> {
+    let before_comma = cx.request.split(',').next().unwrap_or(&cx.request);
+    let count = before_comma.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).count();
+    let mut words: Vec<&str> = cx.words.split_whitespace().take(count).collect();
+    if let Some(at) = words.iter().position(|w| *w == "nimega") {
+        words.truncate(at);
+    }
+    words
+}
+
+/// The last word that names the thing (not a complement) is the head of an Estonian noun phrase.
+fn last_head(words: &[&str], cue: fn(&str) -> bool) -> Option<usize> {
+    words.iter().enumerate().rev().find(|(_, w)| cue(w) && !is_complement_case(w)).map(|(i, _)| i)
+}
+
+fn is_game_word(w: &str) -> bool {
+    const FORMS: &[&str] = &[
+        "mäng",
+        "mängu",
+        "mängus",
+        "mängust",
+        "mängule",
+        "mängul",
+        "mänguga",
+        "mängud",
+        "mänge",
+        "mängude",
+        "mängudes",
+        "mängudest",
+        "mängudele",
+        "mängudel",
+        "mängudega",
+        "mängusid",
+        "mänguks",
+    ];
+    FORMS.iter().any(|f| w.ends_with(f))
 }
 
 fn credits(app: &Path) -> (bool, String) {

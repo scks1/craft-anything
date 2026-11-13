@@ -117,7 +117,7 @@ Allow generated assets	Permitir recursos gerados
 Allow once	Permitir uma vez
 Allowed for this project	Permitido para este projeto
 Allowed for this project.	Permitido para este projeto.
-Allowed in	Autorizações em
+Allowed in	Permitido em
 Allowed once	Permitido uma vez
 Allowed once.	Permitido uma vez.
 Also list projects from	Também listar projetos de
@@ -893,6 +893,7 @@ Read a Unity game's IL2CPP metadata	Ler metadados IL2CPP de um jogo Unity
 Read a game's files	Ler os arquivos de um jogo
 Read a project file	Ler um arquivo do projeto
 Read a setting	Ler uma configuração
+Read a text file	Ler um arquivo de texto
 Read an app's screen	Ler a tela de um aplicativo
 Read bytes	Ler bytes
 Read comment	Ler comentário
@@ -1444,21 +1445,46 @@ Bring all to front	Trazer todas para a frente
 Drag to give the plan more or less room; double-click to reset	Arraste para ajustar o espaço do plano. Clique duas vezes para restaurar o tamanho original
 Copy the message	Copiar a mensagem
 {n} · ${spent} of ${budget}	{n} · ${spent} de ${budget}
-Choose what the builder's approvals get	Escolher o que as aprovações do agente recebem
+Choose what the builder's approvals get	Escolha o comportamento das aprovações do agente
 Reading the web	Ler a web
 Other commands	Outros comandos
 Files outside the project	Arquivos fora do projeto
-Pushing and publishing	Push e publicação
+Pushing and publishing	Enviar (push) e publicar
 Deleting outside the project	Apagar fora do projeto
 System changes	Mudanças no sistema
 Other tools	Outras ferramentas
 Allow	Permitir
 Ask	Perguntar
 Refuse	Recusar
-After /approvals, type a kind and allow, ask, refuse or default, like /approvals publish ask. Kinds: {kinds}.	Depois de /approvals, digite um tipo e allow, ask, refuse ou default, por exemplo /approvals publish ask. Tipos: {kinds}.
+After /approvals, type a kind and allow, ask, refuse or default, like /approvals publish ask. Kinds: {kinds}.	Depois de /approvals, digite um tipo e allow, ask, refuse ou default, por exemplo: /approvals publish ask. Tipos: {kinds}.
 There's no kind called {name}. Kinds: {kinds}.	Não existe um tipo chamado {name}. Tipos: {kinds}.
 Approvals	Aprovações
 In this project, {kind}: {choice}.	Neste projeto, {kind}: {choice}.
-Couldn't change the approvals:	Não foi possível mudar as aprovações:
+Couldn't change the approvals:	Não foi possível alterar as aprovações:
 What the builder may do without asking you, in this project.	O que o agente pode fazer sem perguntar a você, neste projeto.
-Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	Padrão segue o modo automático: ligado, o que pode ser desfeito segue em frente e o resto é recusado; desligado, o agente pergunta.
+Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	A opção Padrão segue o Modo automático: com ele ativado, o que pode ser desfeito é executado e o restante é recusado; com ele desativado, o agente pergunta antes.
+Connecting to {name}… {seconds} s	Conectando a {name}… {seconds} s
+Stopped adding {name}.	A adição de {name} foi interrompida.
+It isn't there any more, so {program} runs in its place.	Ele não está mais lá, então {program} é usado no lugar.
+Use it	Usar este
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	O ArtCraft Launcher gerencia a versão deste aplicativo. Altere a versão nele.
+Check again	Verificar novamente
+Check for Updates	Verificar atualizações
+Check for Updates…	Verificar atualizações…
+Checking for updates…	Verificando atualizações…
+Couldn't check for updates: {error}	Não foi possível verificar atualizações: {error}
+Downloading and verifying the update…	Baixando e verificando a atualização…
+No installer is available for this platform.	Não há instalador disponível para esta plataforma.
+Releases	Versões
+Save your work and stop running tasks before installing an update.	Salve seu trabalho e interrompa as tarefas em execução antes de instalar uma atualização.
+The update failed: {error}	A atualização falhou: {error}
+The update worker stopped unexpectedly. Try checking again.	O processo de atualização parou inesperadamente. Tente verificar novamente.
+This installation is managed externally. Update it with its package manager or open Releases.	Esta instalação é gerenciada externamente. Atualize-a pelo gerenciador de pacotes ou abra Versões.
+Update and restart	Atualizar e reiniciar
+Update ready. Restarting…	Atualização pronta. Reiniciando…
+Updated to {version}.	Atualizado para {version}.
+Use Releases or your package manager to update this installation.	Use Versões ou seu gerenciador de pacotes para atualizar esta instalação.
+You're up to date.	Você está usando a versão mais recente.
+{version} is available.	{version} está disponível.

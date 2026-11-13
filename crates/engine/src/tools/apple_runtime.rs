@@ -75,7 +75,10 @@ pub struct ObserveUiParams {
     /// A specific window to restrict to (on Windows, its window handle).
     #[serde(default)]
     pub window_id: Option<u64>,
-    /// Include a screenshot (PNG, base64) alongside the tree.
+    /// Include a screenshot (PNG, base64) alongside the tree. macOS 14+: captures one on-screen
+    /// window belonging to pid, restricted by window_id when supplied, at up to 2048 pixels
+    /// per side. Without window_id, captures the first matching window. Needs existing Screen
+    /// Recording permission; failures are explicit limitations and never open permission dialogs.
     #[serde(default)]
     pub screenshot: bool,
     /// Include the accessibility tree.
@@ -468,13 +471,34 @@ mod macos {
         } else {
             format!("Skipped the accessibility tree for pid {pid}, as requested.")
         };
-        let b =
+        let truncated = result.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+        let screenshot_limitation = if p.screenshot && result.get("screenshot").is_none() {
+            let error = result.get("screenshot_error");
+            Some(Limitation::new(
+                error.and_then(|e| e.get("code")).and_then(Value::as_str).unwrap_or("screenshot_unavailable"),
+                error
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("The requested screenshot was not captured; check the helper error and retry."),
+            ))
+        } else {
+            None
+        };
+        let mut b =
             EvidenceBuilder::new("runtime_ui_read", Subject { kind: "ui".into(), sha256: None, name: Some(format!("pid {pid}")) }, env(ctx, "accessibility"))
-                .params(json!({"pid": pid, "max_nodes": p.max_nodes, "screenshot": p.screenshot, "accessibility": p.accessibility}))
+                .params(json!({"pid": pid, "window_id": p.window_id, "max_nodes": p.max_nodes, "screenshot": p.screenshot, "accessibility": p.accessibility}))
                 .result(result)
                 .summary(summary)
                 .confidence(Confidence::Observed)
                 .authority(Authority::OurRun);
+        if truncated {
+            b = b
+                .limitation(Limitation::new("tree_truncated", "The accessibility tree reached the node or output limit; only a prefix is included."))
+                .coverage(Coverage { status: craft_anything_evidence::CoverageStatus::Partial, ..Coverage::default() });
+        }
+        if let Some(limitation) = screenshot_limitation {
+            b = b.limitation(limitation).coverage(Coverage { status: craft_anything_evidence::CoverageStatus::Partial, ..Coverage::default() });
+        }
         Ok(ToolOutput::evidence(b.build()?))
     }
 
@@ -634,6 +658,30 @@ mod tests {
         }
     }
 
+    /// Exercise the real serializer with synthetic AX values and image data; no UI permissions.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_budgets_combined_tree_and_screenshot_output() {
+        use craft_anything_platform::process::Process;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let source = include_str!("apple_runtime/native_ui_helper.swift").split("let input = FileHandle.standardInput").next().unwrap();
+        let fixture = include_str!("apple_runtime/output_budget_test.swift");
+        let src = root.path().join("budget.swift");
+        let bin = root.path().join("budget");
+        std::fs::write(&src, format!("{source}\n{fixture}")).unwrap();
+        Process::new("xcrun")
+            .args(["swiftc", "-Onone", "-module-cache-path"])
+            .arg(root.path().join("module-cache"))
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .timeout(Duration::from_secs(60))
+            .run_checked()
+            .unwrap();
+        Process::new(&bin).timeout(Duration::from_secs(30)).run_checked().unwrap();
+    }
+
     /// Run the real Swift helper without reading app UI or requiring Accessibility permission.
     /// Both zero and positive node limits must return an empty, non-truncated tree and evidence
     /// that records the skipped read.
@@ -647,8 +695,35 @@ mod tests {
             assert_eq!(output["result"]["nodes"], json!([]), "{output}");
             assert_eq!(output["result"]["truncated"], false, "{output}");
             assert_eq!(output["params"]["accessibility"], false, "{output}");
+            assert!(output["result"].get("screenshot").is_none(), "{output}");
+            assert!(output["result"].get("screenshot_error").is_none(), "{output}");
             assert!(output["summary"].as_str().unwrap().contains("Skipped the accessibility tree"), "{output}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reports_a_requested_screenshot_that_cannot_be_captured() {
+        let e = Engine::new(crate::testing::session());
+        // This process has no windows. A deliberately impossible window id ensures the helper
+        // can never capture anything, even on a machine with Screen Recording permission.
+        let output = e
+            .call("runtime_ui_read", json!({"pid": std::process::id(), "window_id": u64::MAX, "accessibility": false, "screenshot": true}), granted())
+            .unwrap()
+            .to_json();
+        assert_eq!(output["result"]["nodes"], json!([]), "{output}");
+        assert!(output["result"].get("screenshot").is_none(), "{output}");
+        let error = &output["result"]["screenshot_error"];
+        assert!(
+            matches!(
+                error["code"].as_str(),
+                Some("screen_recording_denied" | "screenshot_window_not_found" | "screenshot_unsupported" | "screenshot_capture_failed")
+            ),
+            "{output}"
+        );
+        assert!(output["limitations"].as_array().unwrap().iter().any(|l| l["code"] == error["code"] && l["message"] == error["message"]), "{output}");
+        assert_eq!(output["coverage"]["status"], "partial", "{output}");
+        assert_eq!(output["params"]["window_id"], u64::MAX, "{output}");
     }
 
     #[cfg(target_os = "macos")]

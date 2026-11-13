@@ -16,19 +16,22 @@ use std::time::Duration;
 
 #[derive(Debug, Args)]
 pub struct RebuildArgs {
-    /// A web address, an absolute path to an app, game or file, or `-` for none.
+    /// A web address, an absolute path to an app, game or file, or `-` for none. A folder that
+    /// already holds a project keeps its saved target.
     pub target: String,
-    /// What to make, in your words.
+    /// What to make, in your words; a folder that already holds a project gets it as a follow-up.
     pub request: String,
     /// Where the new project folder goes (default: the projects folder from settings).
     #[arg(long, conflicts_with = "project_folder")]
     pub projects_dir: Option<PathBuf>,
     /// Start the new project in this folder itself (it's added to the project list). If it
-    /// already has files, --existing says what they are.
+    /// already has files, --existing says what they are; if it already holds a project, its saved
+    /// target, settings and stack are kept and the request becomes a follow-up.
     #[arg(long, conflicts_with = "continue_in")]
     pub project_folder: Option<PathBuf>,
-    /// With --project-folder that has files: `edit` (they're the app, edited in place) or
-    /// `start-from` (material to start from; the app is built in app/ beside them).
+    /// With --project-folder that has files and isn't a project yet: `edit` (they're the app,
+    /// edited in place) or `start-from` (material to start from; the app is built in app/ beside
+    /// them).
     #[arg(long, requires = "project_folder", value_parser = ["edit", "start-from"])]
     pub existing: Option<String>,
     /// Continue an existing project folder; the request becomes a follow-up message.
@@ -93,9 +96,14 @@ fn ensure_agent(hub: &AiHub, requested: Option<&str>) -> Result<(), ToolError> {
     Ok(())
 }
 
+/// The `rebuild` command: open or make the project, start the run, and print its events until it ends.
 fn run(cli: &Cli, a: &RebuildArgs) -> Result<bool, ToolError> {
     let engine = make_engine(None, cli.deep_for_run())?;
     let hub = AiHub::new(engine.clone());
+    // Before the build starts, while no session lock is held (#1225).
+    if let Err(e) = hub.ensure_session_id() {
+        log::warn!("couldn't save the OpenCode Go session id: {e}");
+    }
     if a.build_with.is_some() && a.continue_in.is_some() {
         return Err(ToolError::invalid("--build-with is for new projects; a project keeps the stack it was built with.")
             .with_remediation("Leave out --build-with, or start a new project."));
@@ -117,6 +125,21 @@ fn run(cli: &Cli, a: &RebuildArgs) -> Result<bool, ToolError> {
             let settings = engine.session().settings.clone();
             let existing = a.existing.as_deref().map(|e| if e == "edit" { ExistingFiles::Edit } else { ExistingFiles::StartFrom });
             let folder = a.project_folder.as_deref().map(std::path::absolute).transpose().map_err(|e| ToolError::io("--project-folder", e))?;
+            let attached = folder.as_ref().is_some_and(|f| rebuild::project::has_project(f));
+            if attached {
+                if a.existing.is_some() {
+                    return Err(ToolError::invalid("This folder already holds a project; use --continue-in to continue it."));
+                }
+                if a.build_with.is_some() {
+                    return Err(ToolError::invalid("--build-with is for new projects; a project keeps the stack it was built with.")
+                        .with_remediation("Leave out --build-with, or start a new project."));
+                }
+                if a.generate_assets {
+                    return Err(
+                        ToolError::invalid("--generate-assets is for new projects.").with_remediation("Use project-assets-allow for an existing project.")
+                    );
+                }
+            }
             let place = match (&folder, &a.projects_dir) {
                 (Some(f), _) => Place::At(f, existing),
                 (None, Some(d)) => Place::In(d),
@@ -126,10 +149,13 @@ fn run(cli: &Cli, a: &RebuildArgs) -> Result<bool, ToolError> {
             if folder.is_some() {
                 engine.session().remember_project(&ws.root)?;
             }
-            (ws, None)
+            (ws, rebuild::project::attached_request(attached, &a.request))
         }
     };
     println!("Project: {}", ws.root.display());
+    // The saved builder may be off or gone; say who builds once the run has started, so a failed
+    // start doesn't claim an AI that never ran.
+    let replacement = rebuild::builder_replacement(&hub.config(), &ws, a.backend.as_deref());
     // A follow-up shows in the project's feed as the person typed it.
     let shown = message.clone();
     let good_enough = engine.session().settings.build.good_enough;
@@ -141,9 +167,13 @@ fn run(cli: &Cli, a: &RebuildArgs) -> Result<bool, ToolError> {
         max_rounds: a.rounds,
         good_enough,
         beginner: !cli.json,
+        clean_room: Some(engine.session().clean_room()),
         ..RunOptions::default()
     };
     let mut run = RebuildRun::start(&hub, ws, opts)?;
+    if let Some(replacement) = replacement {
+        eprintln!("{}", rebuild::replaced_builder_notice(&replacement.saved, &replacement.used));
+    }
     let mut ok = false;
     let mut line_open = false;
     loop {

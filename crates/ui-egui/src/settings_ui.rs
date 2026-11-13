@@ -317,6 +317,7 @@ fn model_options_loading(ui: &mut Ui, backend: &str) {
 }
 
 /// Draw AI settings and model pickers, preserving drafts during contention and invalidating confirmed context changes.
+/// Connection checks are delegated to the shared worker API.
 fn ai(app: &mut CraftApp, ui: &mut Ui) {
     if app.agent_model_picker.as_ref().is_some_and(|p| app.hub.model_context(&p.context.backend.config.name).is_ok_and(|current| current != p.context)) {
         app.agent_model_picker = None;
@@ -330,14 +331,18 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
         ui.label(RichText::new(tr("No AI is set up yet. The built-in engines still work; an AI adds plain-words answers.")).color(t.text_dim));
     }
     let (mut pick, mut builds, mut extracts, mut toggle, mut remove) = (None, None, None, None, None);
-    let (mut choose_program, mut usual_program) = (None, None);
+    let (mut choose_program, mut usual_program, mut use_program) = (None, None, None);
+    let mut check_agent = None;
     let mut save_folder = None;
     // Taken out while the rows borrow the app, and put back after them.
     let mut folder_drafts = std::mem::take(&mut app.folder_inputs);
+    let mut key_drafts = std::mem::take(&mut app.backend_key_inputs);
     let (mut pick_model, mut chosen_model, mut close_picker) = (None, None, false);
     let mut chosen_effort = None;
     let (mut pick_agent_model, mut chosen_agent_model, mut remote_program) = (None, None, None);
     let (mut tune_models, mut save_tuning) = (Vec::new(), None);
+    // A saved API key being replaced or forgotten (the keychain work happens off this frame).
+    let (mut save_key, mut forget_key) = (None, None);
     // The AI whose Remove was pressed once: asked again before its key is deleted.
     let confirm_id = egui::Id::new("remove-ai");
     let confirming: Option<String> = ui.data(|d| d.get_temp(confirm_id));
@@ -372,6 +377,19 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                                 usual_program = Some(b.name.clone());
                             }
                         });
+                        // The saved program is gone (an update moved it): say what runs instead,
+                        // and offer to save that one when it's a file of its own (#721).
+                        if let Some(instead) = app.program_replaced.get(&b.name) {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.style_mut().override_font_id = Some(egui::FontId::proportional(theme::CAPTION));
+                                let text = trf("It isn't there any more, so {program} runs in its place.", &[("program", instead)]);
+                                ui.add(egui::Label::new(RichText::new(text).color(t.warning).size(theme::CAPTION)).wrap());
+                                let path = std::path::Path::new(instead);
+                                if path.parent().is_some_and(|p| !p.as_os_str().is_empty()) && widgets::link(ui, "Use it").clicked() {
+                                    use_program = Some((b.name.clone(), instead.clone()));
+                                }
+                            });
+                        }
                     }
                     // The folder it keeps its sign-in in (Claude Code's CLAUDE_CONFIG_DIR), typed
                     // so `~/` and hidden folders work, here or over SSH: another folder is another
@@ -551,6 +569,42 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                     }
                 });
             });
+            // A key saved in the app silently wins over the environment's, so it can be replaced
+            // here without removing the AI (#1358). Every API backend can need one; agent apps
+            // sign in their own way. The field stays even when a key is saved, so a replacement
+            // doesn't need Forget first.
+            if b.kind != BackendKind::AgentCli {
+                // A save or forget for this backend is still running: no later action may be
+                // submitted until it finishes, so workers can't overtake one another. Other
+                // backends keep their controls.
+                ui.add_enabled_ui(!app.backend_key_pending.contains(&b.name), |ui| {
+                    if app.backend_keys.as_ref().and_then(|keys| keys.get(&b.name).copied()) == Some(true) {
+                        ui.horizontal_wrapped(|ui| {
+                            widgets::pill(ui, "Key saved", t.success, t.raised);
+                            if widgets::secondary(ui, None, "Forget the key").clicked() {
+                                forget_key = Some(b.name.clone());
+                            }
+                        });
+                    }
+                    let key = key_drafts.entry(b.name.clone()).or_default();
+                    ui.horizontal_wrapped(|ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(key)
+                                .password(true)
+                                .hint_text(tr("API key (stored in your system keychain)"))
+                                .desired_width(260.0)
+                                .frame(widgets::text_field_frame_compact(&t)),
+                        );
+                        widgets::named(r, &trf("{name} key", &[("name", &b.name)]));
+                        let k = key.trim().to_string();
+                        if widgets::primary_icon(ui, None, "Save", !k.is_empty()).clicked() && !k.is_empty() {
+                            // Keep the draft until the save succeeds; a failure must not lose it.
+                            save_key = Some((b.name.clone(), k));
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+            }
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(26.0);
@@ -581,6 +635,14 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                         extracts = Some(Some(b.name.clone()));
                     }
                 }
+                if b.kind == BackendKind::AgentCli && b.ssh_host.as_deref().is_none_or(|host| host.trim().is_empty()) {
+                    let pending = app.agent_connections.get(&b.name) == Some(&None);
+                    ui.add_enabled_ui(!pending, |ui| {
+                        if widgets::secondary(ui, None, if pending { "Checking" } else { "Check" }).clicked() {
+                            check_agent = Some(b.name.clone());
+                        }
+                    });
+                }
                 // Off: kept with its key, but nothing uses it.
                 let (label, tip) = if b.enabled {
                     ("Turn off", "Nothing uses it until it's on again; it keeps its key.")
@@ -591,9 +653,13 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                     toggle = Some((b.name.clone(), !b.enabled));
                 }
                 if confirming.as_ref() == Some(&b.name) {
-                    if widgets::secondary(ui, Some("trash-2"), "Remove it and its key").clicked() {
-                        remove = Some(b.name.clone());
-                    }
+                    // A key save or forget for this backend is still running: the save could
+                    // write the key back after the backend and its key are gone.
+                    ui.add_enabled_ui(!app.backend_key_pending.contains(&b.name), |ui| {
+                        if widgets::secondary(ui, Some("trash-2"), "Remove it and its key").clicked() {
+                            remove = Some(b.name.clone());
+                        }
+                    });
                     if widgets::link(ui, "Keep it").clicked() {
                         ui.data_mut(|d| d.remove::<String>(confirm_id));
                     }
@@ -604,11 +670,30 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
             if !b.enabled {
                 ui.label(RichText::new(tr("Off")).color(t.text_faint).size(theme::CAPTION));
             }
+            if let Some(Some(result)) = app.agent_connections.get(&b.name) {
+                let (message, color) = match result {
+                    Ok(message) => (message, t.text_dim),
+                    Err(message) => (message, t.danger),
+                };
+                ui.label(RichText::new(message).color(color).size(theme::CAPTION));
+            }
         });
         ui.add_space(6.0);
     }
+    key_drafts.retain(|name, _| app.backends.iter().any(|backend| &backend.name == name));
+    app.backend_key_inputs = key_drafts;
+    app.folder_inputs = folder_drafts;
+    if let Some((name, key)) = save_key {
+        app.save_backend_key(name, key);
+    }
+    if let Some(name) = forget_key {
+        app.remove_backend_key(name);
+    }
     if let Some((name, on)) = toggle {
         app.set_backend_enabled(&name, on);
+    }
+    if let Some(name) = check_agent {
+        app.check_agent_connection(name);
     }
     if let Some(name) = choose_program {
         app.picking_program_for = Some(name);
@@ -617,7 +702,9 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     if let Some(name) = usual_program {
         app.set_agent_program(&name, None);
     }
-    app.folder_inputs = folder_drafts;
+    if let Some((name, program)) = use_program {
+        app.set_agent_program(&name, Some(program));
+    }
     if let Some((name, folder)) = save_folder {
         app.set_agent_folder(&name, Some(folder));
     }
@@ -664,22 +751,18 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     }
     ui.add_space(8.0);
     let detected = app.detected.clone().unwrap_or_default();
-    let mut tab = {
-        let (providers, harnesses) = crate::detect_tabs::counts(&detected);
-        crate::detect_tabs::resolve(app.state.detect_tab, providers, harnesses)
-    };
-    ui.horizontal(|ui| {
-        widgets::caption(ui, "Found on this computer");
-        ui.add_space(12.0);
-        tab = crate::detect_tabs::bar(ui, &mut app.state.detect_tab, &detected);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    widgets::caption(ui, "Found on this computer");
+    let tab = ui
+        .horizontal_wrapped(|ui| {
+            let tab = crate::detect_tabs::buttons(ui, &mut app.state.detect_tab, &detected);
             if app.detecting {
                 ui.add(crate::widgets::Spinner::new().color(t.accent));
             } else if widgets::secondary(ui, Some("radar"), "Detect").clicked() {
                 app.detect_backends();
             }
-        });
-    });
+            tab
+        })
+        .inner;
     ui.add_space(4.0);
     if detected.is_empty() && !app.detecting {
         ui.label(
@@ -695,28 +778,34 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
         let configured = app.backends.iter().any(|b| b.name == d.suggestion.name);
         widgets::panel(&t).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(&d.suggestion.name).font(theme::medium(theme::SMALL)));
-                    ui.label(RichText::new(&d.reason).color(t.text_faint).size(theme::CAPTION));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if configured {
-                        widgets::pill(ui, "Added", t.success, t.raised);
-                        // Claude Code once more, to give it another account's folder.
-                        if craft_anything_ai::folder_var(&d.suggestion).is_some()
-                            && widgets::link(ui, "Add another").on_hover_text(tr("Add it again, to choose another account's folder for it.")).clicked()
-                        {
-                            let taken = |n: &String| app.backends.iter().any(|b| &b.name == n);
-                            if let Some(name) = (2..100).map(|i| format!("{} {i}", d.suggestion.name)).find(|n| !taken(n)) {
-                                app.add_backend(craft_anything_ai::BackendConfig { name, ..d.suggestion.clone() }, None);
-                            }
-                        }
-                    } else if !d.needs_key && widgets::primary(ui, "Add").clicked() {
-                        app.add_backend(d.suggestion.clone(), None);
+            // The buttons first, in the top right corner, then the name and reason wrapped in the
+            // width they leave: a label in a horizontal row doesn't wrap, so a long reason ran on
+            // under the Add button.
+            // Child uis (not scopes, which would move the cursor down after each), then one advance.
+            let top = ui.available_rect_before_wrap();
+            let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(top).layout(egui::Layout::right_to_left(egui::Align::Min)));
+            if configured {
+                widgets::pill(&mut right_ui, "Added", t.success, t.raised);
+                // Claude Code once more, to give it another account's folder.
+                if craft_anything_ai::folder_var(&d.suggestion).is_some()
+                    && widgets::link(&mut right_ui, "Add another").on_hover_text(tr("Add it again, to choose another account's folder for it.")).clicked()
+                {
+                    let taken = |n: &String| app.backends.iter().any(|b| &b.name == n);
+                    if let Some(name) = (2..100).map(|i| format!("{} {i}", d.suggestion.name)).find(|n| !taken(n)) {
+                        app.add_backend(craft_anything_ai::BackendConfig { name, ..d.suggestion.clone() }, None);
                     }
-                });
-            });
+                }
+            } else if !d.needs_key && widgets::primary(&mut right_ui, "Add").clicked() {
+                app.add_backend(d.suggestion.clone(), None);
+            }
+            let right = right_ui.min_rect();
+            // Nothing on the right (a key to paste below instead): the text takes the whole width.
+            let text_right = if right.width() > 0.0 { right.left() - ui.spacing().item_spacing.x } else { top.right() };
+            let mut left_ui =
+                ui.new_child(egui::UiBuilder::new().max_rect(top.with_max_x(text_right.max(top.left()))).layout(egui::Layout::top_down(egui::Align::Min)));
+            left_ui.add(egui::Label::new(RichText::new(&d.suggestion.name).font(theme::medium(theme::SMALL))).wrap());
+            left_ui.add(egui::Label::new(RichText::new(&d.reason).color(t.text_faint).size(theme::CAPTION)).wrap());
+            ui.advance_cursor_after_rect(left_ui.min_rect().union(right));
             // A subscription key is worth pasting even when the environment already has one, so a
             // different key can be used without restarting the app.
             let pastable = d.needs_key || d.suggestion.base_url.as_deref().is_some_and(craft_anything_ai::openai::is_opencode_go);
@@ -765,7 +854,8 @@ pub(crate) fn server_form(app: &mut CraftApp, ui: &mut Ui) {
         let w = ui.available_width() - FRAME;
         field(ui, &mut form.address, "address, e.g. http://192.168.1.20:11434/v1", w, "Server address", false);
     });
-    let ready = !form.name.trim().is_empty() && !form.address.trim().is_empty();
+    // One server at a time: pressing Add again while it's asked would only start a second wait.
+    let ready = !form.name.trim().is_empty() && !form.address.trim().is_empty() && form.connecting.is_none();
     let mut add = false;
     ui.horizontal(|ui| {
         field(ui, &mut form.model, "model (optional)", 150.0, "Model", false);
@@ -774,6 +864,27 @@ pub(crate) fn server_form(app: &mut CraftApp, ui: &mut Ui) {
         field(ui, &mut form.key, "API key, if it needs one", w, "API key", true);
         add = widgets::primary_icon(ui, Some("plus"), "Add", ready).clicked() && ready;
     });
+    // A server still starting or loading a model may take up to a minute to answer: say it's being
+    // asked and for how long, so the form doesn't look like nothing happened (#1429).
+    let mut stop = None;
+    if let Some((job, name, started)) = &form.connecting {
+        let seconds = started.elapsed().as_secs().to_string();
+        ui.horizontal(|ui| {
+            ui.add(widgets::Spinner::new().size(theme::CAPTION).color(t.accent));
+            ui.label(
+                RichText::new(trf("Connecting to {name}… {seconds} s", &[("name", name), ("seconds", &seconds)])).color(t.text_faint).size(theme::CAPTION),
+            );
+            // Waiting out the minute isn't the only way: what was typed stays to fix and add again.
+            if widgets::secondary(ui, Some("x"), "Stop").clicked() {
+                stop = Some(*job);
+            }
+        });
+        // The seconds count on even when the spinner is out of view.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    }
+    if let Some(job) = stop {
+        app.jobs.cancel(job);
+    }
     if add {
         app.add_server();
     }
@@ -810,6 +921,11 @@ fn builds(app: &mut CraftApp, ui: &mut Ui) {
         changed |= number(ui, &mut b.parallel, 1..=8, "", "");
     });
     ui.add_space(8.0);
+    if let Some(bytes) = app.pinned_copy_bytes {
+        row(ui, "Pinned builds", "Size", |ui| {
+            ui.label(craft_anything_engine::evidence::human_bytes(bytes));
+        });
+    }
     widgets::caption(ui, "Generated art (games)");
     let a = &mut app.settings.assets;
     row(
@@ -1016,6 +1132,230 @@ mod tests {
     use craft_anything_ai::{BackendConfig, BackendKind};
 
     #[test]
+    /// A non-Codex local agent gets the same Check action and result presentation.
+    fn agent_connection_check_and_its_result_are_visible_in_settings() {
+        let mut app = demo::app(demo::engine(craft_anything_engine::Mode::Experienced, true));
+        app.backends = vec![BackendConfig {
+            name: "Agent test".into(),
+            kind: BackendKind::AgentCli,
+            model: "plain-test-agent".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        }];
+        app.agent_connections.insert("Agent test".into(), Some(Err("Agent test is installed but is not signed in.".into())));
+        let context = egui::Context::default();
+        theme::install_fonts(&context);
+        let mut output = context.run_ui(Default::default(), |ui| ai(&mut app, ui));
+        output.textures_delta.clear();
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Check"));
+        assert!(text.contains("Agent test is installed but is not signed in."));
+    }
+
+    /// #1358: an API backend with a saved key can have it replaced or forgotten in place, while an
+    /// agent app (which signs in its own way) has no key row.
+    #[test]
+    fn a_saved_backend_key_can_be_replaced_or_forgotten() {
+        use std::collections::BTreeMap;
+
+        let mut app = demo::app(demo::engine(craft_anything_engine::Mode::Experienced, true));
+        app.backends = vec![BackendConfig {
+            name: "OpenAI test".into(),
+            kind: BackendKind::Openai,
+            model: "gpt-test".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        }];
+        let render = |app: &mut CraftApp| {
+            let context = egui::Context::default();
+            theme::install_fonts(&context);
+            let mut output = context.run_ui(Default::default(), |ui| ai(app, ui));
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        app.backend_keys = Some(BTreeMap::from([("OpenAI test".to_string(), true)]));
+        let text = render(&mut app);
+        assert!(text.contains("Key saved"), "a saved key says so: {text}");
+        assert!(text.contains("Forget the key"), "and can be forgotten without removing the AI: {text}");
+        assert!(text.contains("API key (stored in your system keychain)"), "and replaced without forgetting it first: {text}");
+
+        app.backend_keys = Some(BTreeMap::from([("OpenAI test".to_string(), false)]));
+        let text = render(&mut app);
+        assert!(text.contains("API key (stored in your system keychain)"), "a backend without one asks for it: {text}");
+        assert!(text.contains("Save"));
+        assert!(!text.contains("Key saved"));
+
+        // Every API backend gets the row, including a local OpenAI-compatible server.
+        app.backends = vec![BackendConfig {
+            name: "Local test".into(),
+            kind: BackendKind::OpenaiCompatible,
+            model: "local-test".into(),
+            base_url: Some("http://127.0.0.1:9/v1".into()),
+            ssh_host: None,
+            enabled: true,
+        }];
+        app.backend_keys = Some(BTreeMap::from([("Local test".to_string(), false)]));
+        let text = render(&mut app);
+        assert!(text.contains("API key (stored in your system keychain)"), "a local server can take a key too: {text}");
+
+        app.backends = vec![BackendConfig {
+            name: "Agent test".into(),
+            kind: BackendKind::AgentCli,
+            model: "plain-test-agent".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        }];
+        app.backend_keys = Some(BTreeMap::from([("Agent test".to_string(), false)]));
+        let text = render(&mut app);
+        assert!(!text.contains("Key saved"));
+        assert!(!text.contains("Forget the key"));
+        assert!(!text.contains("API key (stored in your system keychain)"), "an agent app has no key row: {text}");
+    }
+
+    /// A key check that started before a save or a newer check must not put the old state back.
+    #[test]
+    fn a_stale_backend_key_check_does_not_replace_a_newer_one() {
+        use std::collections::BTreeMap;
+
+        let mut app = demo::app(demo::engine(craft_anything_engine::Mode::Experienced, true));
+        app.backend_keys_request = 2;
+        app.backend_keys = Some(BTreeMap::from([("OpenAI".to_string(), true)]));
+        app.handle_done(Finished { job: 1, result: Ok(Done::BackendKeys { request: 1, keys: BTreeMap::from([("OpenAI".to_string(), false)]) }) });
+        assert_eq!(app.backend_keys.as_ref().and_then(|keys| keys.get("OpenAI")), Some(&true), "the newer state stays");
+        app.handle_done(Finished { job: 2, result: Ok(Done::BackendKeys { request: 2, keys: BTreeMap::from([("OpenAI".to_string(), false)]) }) });
+        assert_eq!(app.backend_keys.as_ref().and_then(|keys| keys.get("OpenAI")), Some(&false), "the current check applies");
+    }
+
+    /// A failed key save keeps what was typed; a success clears it only when it is still the same
+    /// text, so an edit made while the save was running is not lost.
+    #[test]
+    fn a_key_draft_survives_a_failed_save_and_a_newer_edit() {
+        use std::collections::BTreeMap;
+
+        let mut app = demo::app(demo::engine(craft_anything_engine::Mode::Experienced, true));
+        app.backend_keys_request = 1;
+        app.backend_key_inputs.insert("OpenAI".into(), "sk-draft".into());
+        app.handle_done(Finished {
+            job: 1,
+            result: Ok(Done::BackendKeyResult {
+                request: 1,
+                name: "OpenAI".into(),
+                keys: BTreeMap::from([("OpenAI".to_string(), false)]),
+                error: Some("keychain is locked".into()),
+                saved_key: None,
+                forgot: false,
+            }),
+        });
+        assert_eq!(app.backend_key_inputs.get("OpenAI").map(String::as_str), Some("sk-draft"), "a failure keeps the draft");
+        assert_eq!(app.backend_keys.as_ref().and_then(|keys| keys.get("OpenAI")), Some(&false), "a failure still refreshes the shown status");
+
+        app.backend_key_inputs.insert("OpenAI".into(), "sk-edited".into());
+        app.handle_done(Finished {
+            job: 2,
+            result: Ok(Done::BackendKeyResult {
+                request: 1,
+                name: "OpenAI".into(),
+                keys: BTreeMap::from([("OpenAI".to_string(), true)]),
+                error: None,
+                saved_key: Some("sk-saved".into()),
+                forgot: false,
+            }),
+        });
+        assert_eq!(app.backend_key_inputs.get("OpenAI").map(String::as_str), Some("sk-edited"), "a newer edit stays");
+
+        app.backend_key_inputs.insert("OpenAI".into(), "sk-saved ".into());
+        app.handle_done(Finished {
+            job: 3,
+            result: Ok(Done::BackendKeyResult {
+                request: 1,
+                name: "OpenAI".into(),
+                keys: BTreeMap::from([("OpenAI".to_string(), true)]),
+                error: None,
+                saved_key: Some("sk-saved".into()),
+                forgot: false,
+            }),
+        });
+        assert!(!app.backend_key_inputs.contains_key("OpenAI"), "the saved draft is cleared");
+
+        app.backend_key_inputs.insert("OpenAI".into(), "sk-next".into());
+        app.handle_done(Finished {
+            job: 4,
+            result: Ok(Done::BackendKeyResult {
+                request: 1,
+                name: "OpenAI".into(),
+                keys: BTreeMap::from([("OpenAI".to_string(), true)]),
+                error: Some("keychain is locked".into()),
+                saved_key: None,
+                forgot: true,
+            }),
+        });
+        assert_eq!(app.backend_key_inputs.get("OpenAI").map(String::as_str), Some("sk-next"), "a failed forget keeps the draft");
+
+        app.handle_done(Finished {
+            job: 5,
+            result: Ok(Done::BackendKeyResult {
+                request: 1,
+                name: "OpenAI".into(),
+                keys: BTreeMap::from([("OpenAI".to_string(), false)]),
+                error: None,
+                saved_key: None,
+                forgot: true,
+            }),
+        });
+        assert!(!app.backend_key_inputs.contains_key("OpenAI"), "a successful forget clears it");
+    }
+
+    /// A failed worker frees only its own Check button; unrelated pending/results remain intact.
+    #[test]
+    fn failed_agent_check_workers_can_be_retried_without_clearing_other_checks() {
+        let mut app = demo::app(demo::engine(craft_anything_engine::Mode::Experienced, true));
+        app.agent_connections.insert("Failed agent".into(), None);
+        app.agent_connections.insert("Running agent".into(), None);
+        app.agent_connections.insert("Finished agent".into(), Some(Ok("already checked".into())));
+        app.agent_connection_jobs.insert(41, "Failed agent".into());
+        app.agent_connection_jobs.insert(42, "Running agent".into());
+        // Jobs::spawn emits this same Err completion if the thread cannot start (or panics).
+        app.handle_done(Finished { job: 41, result: Err("Couldn't start a worker thread: test failure".into()) });
+        assert!(matches!(app.agent_connections.get("Failed agent"), Some(Some(Err(error))) if error.contains("Couldn't start a worker thread")));
+        assert!(!app.agent_connection_jobs.contains_key(&41));
+        assert_eq!(app.agent_connections.get("Running agent"), Some(&None));
+        assert_eq!(app.agent_connection_jobs.get(&42).map(String::as_str), Some("Running agent"));
+        assert_eq!(app.agent_connections.get("Finished agent"), Some(&Some(Ok("already checked".into()))));
+        app.handle_done(Finished { job: 99, result: Err("unrelated job failed".into()) });
+        assert_eq!(app.agent_connections.get("Running agent"), Some(&None));
+        app.handle_done(Finished { job: 42, result: Ok(Done::AgentConnection("Running agent".into(), Ok("checked".into()))) });
+        assert!(app.agent_connection_jobs.is_empty());
+        assert_eq!(app.agent_connections.get("Running agent"), Some(&Some(Ok("checked".into()))));
+        // The backend is intentionally absent: no real agent or credential access is needed.
+        app.check_agent_connection("Failed agent".into());
+        assert_eq!(app.agent_connections.get("Failed agent"), Some(&None));
+        assert_eq!(app.agent_connection_jobs.len(), 1, "retry was scheduled");
+        let count = app.jobs.list.len();
+        app.check_agent_connection("Failed agent".into());
+        assert_eq!(app.jobs.list.len(), count, "a pending retry cannot start a duplicate");
+    }
+
+    #[test]
     fn identical_model_names_are_shown_once_in_the_shared_picker() {
         use craft_anything_ai::{AgentModel, BackendEntry, ModelContext};
         use egui_kittest::{Harness, kittest::Queryable};
@@ -1205,6 +1545,76 @@ mod model_options_tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// #1429: while a server is asked for its models the form says so, with the seconds waited, and
+    /// Add waits; the line goes when the job ends, whether the server was added or not.
+    #[test]
+    fn a_server_being_added_shows_that_it_is_connecting() {
+        let draw = |app: &mut CraftApp| {
+            let context = egui::Context::default();
+            crate::theme::install_fonts(&context);
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| server_form(app, ui));
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut app = app_with_backend();
+        assert!(!draw(&mut app).contains("Connecting to"), "nothing to say before Add");
+        // Port zero refuses at once: the job never reaches a network.
+        app.server_form.name = "Home box".into();
+        app.server_form.address = "http://127.0.0.1:0/v1".into();
+        app.add_server();
+        let job = app.server_form.connecting.as_ref().map(|(job, ..)| *job).expect("connecting");
+        let text = draw(&mut app);
+        assert!(text.contains("Connecting to Home box… 0 s"), "{text}");
+        // A different job finishing leaves it alone; this one's failure clears it.
+        app.handle_done(crate::jobs::Finished { job: job.wrapping_add(1000), result: Err("other".into()) });
+        assert!(app.server_form.connecting.is_some());
+        let refused = craft_anything_engine::evidence::ToolError::invalid("refused");
+        app.handle_done(crate::jobs::Finished {
+            job,
+            result: Ok(crate::Done::BackendAdded { name: "Home box".into(), result: Err(refused), choices: app.backend_choices }),
+        });
+        assert!(app.server_form.connecting.is_none());
+        assert!(!draw(&mut app).contains("Connecting to"));
+        assert_eq!(app.server_form.address, "http://127.0.0.1:0/v1", "what was typed is kept to fix it");
+    }
+
+    /// #1429: the wait can be stopped from the form; a stop is said plainly, not as an error, and
+    /// what was typed stays.
+    #[test]
+    fn adding_a_server_can_be_stopped_from_the_form() {
+        let mut app = app_with_backend();
+        app.server_form.name = "Home box".into();
+        app.server_form.address = "http://127.0.0.1:0/v1".into();
+        app.add_server();
+        let job = app.server_form.connecting.as_ref().map(|(job, ..)| *job).expect("connecting");
+        let context = egui::Context::default();
+        crate::theme::install_fonts(&context);
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| server_form(&mut app, ui));
+        output.textures_delta.clear();
+        let shown = output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(t) if t.galley.text() == "Stop"));
+        assert!(shown, "a Stop button beside the wait");
+        app.handle_done(crate::jobs::Finished {
+            job,
+            result: Ok(crate::Done::BackendAdded {
+                name: "Home box".into(),
+                result: Err(craft_anything_engine::evidence::ToolError::cancelled()),
+                choices: app.backend_choices,
+            }),
+        });
+        assert!(app.server_form.connecting.is_none());
+        let (text, error) = app.state.toasts.last().cloned().expect("a note");
+        assert_eq!((text.as_str(), error), ("Stopped adding Home box.", false));
+        assert_eq!(app.server_form.name, "Home box", "what was typed is kept to add it again");
     }
 
     #[test]

@@ -141,14 +141,23 @@ const FORMATS: &[(i32, &str)] = &[
     (18, "RFloat"),
     (19, "RGFloat"),
     (20, "RGBAFloat"),
+    (22, "RGB9e5Float"),
     (24, "BC6H"),
     (25, "BC7"),
     (26, "BC4"),
     (27, "BC5"),
     (28, "DXT1Crunched"),
     (29, "DXT5Crunched"),
+    (34, "ETC_RGB4"),
+    (41, "EAC_R"),
+    (42, "EAC_R_SIGNED"),
+    (43, "EAC_RG"),
+    (44, "EAC_RG_SIGNED"),
     (62, "RG16"),
     (63, "R8"),
+    (72, "RG32"),
+    (73, "RGB48"),
+    (74, "RGBA64"),
 ];
 
 /// A pixel format's name, or `format <id>`.
@@ -165,15 +174,32 @@ fn layout(format: i32) -> Option<Layout> {
         4 => Layout::Rgba32,
         5 => Layout::Argb32,
         7 => Layout::Rgb565,
+        9 => Layout::R16,
         10 => Layout::Dxt1,
         12 => Layout::Dxt5,
         13 => Layout::Rgba4444,
         14 => Layout::Bgra32,
+        15 => Layout::RHalf,
+        16 => Layout::RgHalf,
+        17 => Layout::RgbaHalf,
+        18 => Layout::RFloat,
+        19 => Layout::RgFloat,
+        20 => Layout::RgbaFloat,
+        22 => Layout::Rgb9e5,
         24 => Layout::Bc6h,
         25 => Layout::Bc7,
         26 => Layout::Bc4,
         27 => Layout::Bc5,
+        34 => Layout::Etc1,
+        41 => Layout::EacR,
+        42 => Layout::EacRSigned,
+        43 => Layout::EacRg,
+        44 => Layout::EacRgSigned,
+        62 => Layout::Rg8,
         63 => Layout::R8,
+        72 => Layout::Rg16,
+        73 => Layout::Rgb16,
+        74 => Layout::Rgba16,
         _ => return None,
     })
 }
@@ -213,6 +239,29 @@ mod tests {
         for cut in 0..old.len() {
             let _ = parse(&old[..cut], "2017.4.9f1", false);
         }
+    }
+
+    #[test]
+    fn floating_point_formats_keep_channel_order_and_linear_alpha() {
+        let half: Vec<_> = [0x3800u16, 0x3400, 0x3c00, 0x3800].into_iter().flat_map(u16::to_le_bytes).collect();
+        let full: Vec<_> = [0.5f32, 0.25, 1.0, 0.5].into_iter().flat_map(f32::to_le_bytes).collect();
+        for (first, bytes, component_size) in [(15, &half, 2), (18, &full, 4)] {
+            for (i, (channels, expected)) in [(1, [188, 188, 188, 255]), (2, [188, 137, 0, 255]), (4, [188, 137, 255, 128])].into_iter().enumerate() {
+                let format = first + i as i32;
+                let n = channels * component_size;
+                assert_eq!(mip0_size(format, 1, 1), Some(n));
+                assert_eq!(decode(format, 1, 1, bytes).unwrap(), expected);
+                assert!(matches!(decode(format, 1, 1, &bytes[..n - 1]), Err(FormatError::Truncated(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn floating_point_rows_clip_and_keep_nan_dark() {
+        let samples: Vec<_> = [0x7c00u16, 0xfc00, 0x7e00, 0x0001].into_iter().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode(16, 1, 2, &samples).unwrap(), [0, 0, 0, 255, 255, 0, 0, 255]);
+        let samples: Vec<_> = [-2.0f32, 2.0, f32::NAN, f32::INFINITY].into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(decode(20, 1, 1, &samples).unwrap(), [0, 255, 0, 255]);
     }
 
     #[test]

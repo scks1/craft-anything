@@ -109,6 +109,9 @@ impl CraftApp {
                     slot.answer = Some(Ok(answer));
                     slot.reveal = true;
                 }
+                if let Some(notice) = a["builder_notice"].as_str() {
+                    self.toast(notice.to_string(), false);
+                }
                 if let Some(why) = v["not_kept"].as_str() {
                     self.toast(format!("{} {why}", tr("This answer won't be there after a restart:")), true);
                 }
@@ -146,7 +149,7 @@ pub fn card(ui: &mut Ui, a: &mut Asked, glossary: bool) {
             toggle |= icons::button(ui, if a.collapsed { "chevron-right" } else { "chevron-down" }, 22.0, false, name).clicked();
             let (icon, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
             icons::paint(ui, icon, "circle-help", 16.0, t.icon);
-            let line = egui::Label::new(RichText::new(&a.question).strong()).sense(egui::Sense::click()).selectable(false);
+            let line = egui::Label::new(RichText::new(&a.question).font(theme::semibold(theme::BODY))).sense(egui::Sense::click()).selectable(false);
             let line = if a.collapsed { line.truncate() } else { line.wrap() };
             toggle |= ui.add(line).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
         });
@@ -213,6 +216,23 @@ mod tests {
         assert_eq!(out[0].pictures, pics);
         assert_eq!(out[1].text, "/btw where are the files");
         assert!(out[1].pictures.is_empty());
+    }
+
+    #[test]
+    fn a_question_answered_by_a_replacement_says_so() {
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        app.question_done(Ok(serde_json::json!({
+            "project": "/tmp/example",
+            "question": "where?",
+            "answered": {
+                "answer": "In app.",
+                "from": "the_files",
+                "backend": "Claude",
+                "builder_notice": "The AI chosen for this project (Off) is turned off or no longer set up. Claude builds instead."
+            },
+            "not_kept": null
+        })));
+        assert!(app.state.toasts.iter().any(|(t, err)| !*err && t.contains("Off") && t.contains("Claude")), "{:?}", app.state.toasts);
     }
 
     #[test]

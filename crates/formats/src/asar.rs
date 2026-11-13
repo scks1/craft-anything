@@ -9,6 +9,8 @@ use serde_json::Value;
 
 /// Headers bigger than this are refused (real ones are a few MiB at most).
 pub const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
+/// Total bytes retained in entry paths and rejected names after expanding directory prefixes.
+pub const MAX_PATH_BYTES: usize = 8 * 1024 * 1024;
 /// Deepest directory nesting we walk.
 pub const MAX_DEPTH: usize = 128;
 
@@ -97,26 +99,40 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<AsarArchive, AsarError> 
     let v: Value = serde_json::from_slice(json).map_err(|e| AsarError::BadJson(e.to_string()))?;
     let mut out = AsarArchive { json_bytes: json_len, data_offset: 8 + header_pickle as u64, ..Default::default() };
     let files = v.get("files").ok_or_else(|| AsarError::BadJson("no \"files\" object".into()))?;
-    walk(files, "", 0, max_entries, &mut out);
+    let mut remaining = MAX_PATH_BYTES;
+    walk(files, "", 0, max_entries, &mut remaining, &mut out)?;
     Ok(out)
 }
 
-fn walk(files: &Value, prefix: &str, depth: usize, max: usize, out: &mut AsarArchive) {
-    let Some(map) = files.as_object() else { return };
+fn walk(files: &Value, prefix: &str, depth: usize, max: usize, remaining: &mut usize, out: &mut AsarArchive) -> Result<(), AsarError> {
+    let map = files.as_object().ok_or_else(|| AsarError::BadJson(format!("files at {prefix:?} is not an object")))?;
     if depth > MAX_DEPTH {
         out.truncated = true;
-        return;
+        return Ok(());
     }
     for (name, node) in map {
-        if out.entries.len() >= max {
+        if out.entries.len() + out.rejected_names.len() >= max {
             out.truncated = true;
-            return;
+            return Ok(());
         }
+        // A compact tree can repeat one long directory prefix in thousands of paths. Charge
+        // the complete expanded identity before allocating it, including rejected names.
+        let Some(bytes) = prefix.len().checked_add(name.len()).filter(|bytes| *bytes <= *remaining) else {
+            out.truncated = true;
+            return Ok(());
+        };
+        *remaining -= bytes;
+        let path = format!("{prefix}{name}");
         if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') || name.contains('\0') {
-            out.rejected_names.push(format!("{prefix}{name}"));
+            out.rejected_names.push(path);
             continue;
         }
-        let path = format!("{prefix}{name}");
+        if !node.is_object() {
+            return Err(AsarError::BadJson(format!("node at {path:?} is not an object")));
+        }
+        if node.get("files").is_some() && node.get("link").is_some() {
+            return Err(AsarError::BadJson(format!("node at {path:?} is both a directory and a link")));
+        }
         if let Some(children) = node.get("files") {
             out.entries.push(AsarEntry {
                 path: path.clone(),
@@ -128,8 +144,9 @@ fn walk(files: &Value, prefix: &str, depth: usize, max: usize, out: &mut AsarArc
                 link: None,
                 integrity: None,
             });
-            walk(children, &format!("{path}/"), depth + 1, max, out);
-        } else if let Some(link) = node.get("link").and_then(Value::as_str) {
+            walk(children, &format!("{path}/"), depth + 1, max, remaining, out)?;
+        } else if let Some(link) = node.get("link") {
+            let link = link.as_str().ok_or_else(|| AsarError::BadJson(format!("link at {path:?} is not a string")))?;
             out.entries.push(AsarEntry {
                 path,
                 kind: AsarKind::Link,
@@ -141,9 +158,15 @@ fn walk(files: &Value, prefix: &str, depth: usize, max: usize, out: &mut AsarArc
                 integrity: None,
             });
         } else {
-            let size = node.get("size").and_then(Value::as_u64).unwrap_or(0);
-            let unpacked = node.get("unpacked").and_then(Value::as_bool).unwrap_or(false);
+            let size = node.get("size").and_then(Value::as_u64).ok_or_else(|| AsarError::BadJson(format!("file at {path:?} has no unsigned size")))?;
+            let unpacked = match node.get("unpacked") {
+                None => false,
+                Some(value) => value.as_bool().ok_or_else(|| AsarError::BadJson(format!("unpacked at {path:?} is not a boolean")))?,
+            };
             let offset = node.get("offset").and_then(|o| o.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| o.as_u64()));
+            if !unpacked && offset.is_none() {
+                return Err(AsarError::BadJson(format!("packed file at {path:?} has no unsigned offset")));
+            }
             let integrity = node.get("integrity").map(|i| AsarIntegrity {
                 algorithm: i.get("algorithm").and_then(Value::as_str).unwrap_or_default().to_string(),
                 hash: i.get("hash").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase(),
@@ -162,6 +185,7 @@ fn walk(files: &Value, prefix: &str, depth: usize, max: usize, out: &mut AsarArc
             });
         }
     }
+    Ok(())
 }
 
 /// The bytes of a packed file, or `None` when it is unpacked, out of range or not a file.
@@ -222,6 +246,71 @@ pub fn build(files: &[(&str, &[u8])]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_names_consume_the_listing_budget() {
+        let files = serde_json::json!({"../a": {}, "../b": {}, "ok": {"size": 0, "offset": "0"}});
+        let mut archive = AsarArchive::default();
+        let mut remaining = MAX_PATH_BYTES;
+        walk(&files, "", 0, 1, &mut remaining, &mut archive).unwrap();
+        assert_eq!(archive.rejected_names.len(), 1);
+        assert!(archive.entries.is_empty());
+        assert!(archive.truncated);
+    }
+
+    fn archive_header(value: Value) -> Vec<u8> {
+        let json = serde_json::to_vec(&value).unwrap();
+        let mut data = 4u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&((json.len() + 8) as u32).to_le_bytes());
+        data.extend_from_slice(&((json.len() + 4) as u32).to_le_bytes());
+        data.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        data.extend_from_slice(&json);
+        data
+    }
+
+    #[test]
+    fn malformed_nodes_do_not_become_empty_files() {
+        for files in [serde_json::json!([]), serde_json::json!(null), serde_json::json!(42)] {
+            assert!(matches!(parse(&archive_header(serde_json::json!({"files": files})), 10), Err(AsarError::BadJson(_))));
+        }
+        for node in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!({"files": []}),
+            serde_json::json!({"files": {}, "link": "target"}),
+            serde_json::json!({"link": 42}),
+            serde_json::json!({"size": -1, "offset": "0"}),
+            serde_json::json!({"size": "1", "offset": "0"}),
+            serde_json::json!({"size": 0}),
+            serde_json::json!({"size": 0, "offset": "-1"}),
+            serde_json::json!({"size": 0, "offset": "18446744073709551616"}),
+            serde_json::json!({"size": 0, "offset": "0", "unpacked": "false"}),
+        ] {
+            let data = archive_header(serde_json::json!({"files": {"bad": node}}));
+            assert!(matches!(parse(&data, 10), Err(AsarError::BadJson(_))), "{node}");
+        }
+    }
+
+    #[test]
+    fn valid_empty_unpacked_and_link_nodes_keep_their_kinds() {
+        let data = archive_header(serde_json::json!({"files": {
+            "directory": {"files": {}},
+            "empty": {"size": 0, "offset": "0"},
+            "numeric": {"size": 0, "offset": 0},
+            "external": {"size": 10, "unpacked": true},
+            "link": {"link": "empty"}
+        }}));
+        let archive = parse(&data, 10).unwrap();
+        assert_eq!(archive.entries.len(), 5);
+        assert_eq!(archive.get("directory").unwrap().kind, AsarKind::Directory);
+        assert_eq!(archive.get("link").unwrap().kind, AsarKind::Link);
+        assert_eq!(file_bytes(&data, &archive, archive.get("empty").unwrap()), Some(&b""[..]));
+        assert_eq!(file_bytes(&data, &archive, archive.get("numeric").unwrap()), Some(&b""[..]));
+        assert!(archive.get("external").unwrap().unpacked);
+        assert_eq!(file_bytes(&data, &archive, archive.get("external").unwrap()), None);
+    }
 
     #[test]
     fn round_trip() {

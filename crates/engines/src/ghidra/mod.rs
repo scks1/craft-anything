@@ -74,8 +74,8 @@ pub trait DeepDecompiler: Send + Sync {
         None
     }
     /// Decompile the function at `entry` (an address in the engine's own space). `Ok(None)` means
-    /// the engine has no better answer.
-    fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, GhidraError>;
+    /// the engine has no better answer. `waiting` gets a line now and then while it waits (#1714).
+    fn decompile(&self, entry: u64, waiting: &dyn Fn(&str)) -> Result<Option<DeepFunction>, GhidraError>;
     /// List the functions the engine found.
     fn list_functions(&self) -> Result<Vec<DeepFunction>, GhidraError>;
 }
@@ -521,8 +521,49 @@ fn set_aside(project_dir: &Path) -> std::io::Result<Option<Aside>> {
     }
     let token = random_token();
     let aside = project_dir.with_extension(format!("orphaned-{}", token.get(..8).unwrap_or(&token)));
-    std::fs::rename(project_dir, &aside)?;
-    Ok(Some(Aside(aside)))
+    match std::fs::rename(project_dir, &aside) {
+        Ok(()) => Ok(Some(Aside(aside))),
+        // Gone between the check and the move: nothing to move, not a reason to wait.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a refused move may pass: Windows reports a folder it has open files in as a permission
+/// and an antivirus holding a handle looks the same for a moment.
+/// Anything else — a path we cannot even name — is the caller's to hear now, not after a timeout.
+fn move_may_pass(e: &std::io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION: what Windows says for a folder another
+    // process has open without delete sharing, which is the live Ghidra this whole change is
+    // about. Rust files both under `Uncategorized`, which is unstable, so the system code is read
+    // directly — the one thing that makes this branch mean anything on Windows.
+    const SHARING_VIOLATION: i32 = 32;
+    const LOCK_VIOLATION: i32 = 33;
+    matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock)
+        || matches!(e.raw_os_error(), Some(SHARING_VIOLATION | LOCK_VIOLATION))
+}
+
+/// The error for a move that cannot pass: the lock goes back first, because left behind it reads
+/// to every other process as an analysis in progress. What the person hears is the move, and a
+/// lock that also cannot be released is named beside it rather than hiding it.
+fn refuse_move(lock: &Path, project_dir: &Path, refusal: &std::io::Error) -> GhidraError {
+    let moving = format!("moving {} out of the way: {refusal}", project_dir.display());
+    match release(lock) {
+        Ok(()) => GhidraError::Launch(moving),
+        // The second reason without the outer "could not start Ghidra", which would read twice.
+        Err(GhidraError::Launch(also)) => GhidraError::Launch(format!("{moving}; and {also}")),
+        Err(other) => GhidraError::Launch(format!("{moving}; and {other}")),
+    }
+}
+
+/// Give the analysis lock back. A lock this process cannot release would read to everyone else as
+/// an analysis in progress, so it ends the attempt with the reason instead of waiting it out.
+fn release(lock: &Path) -> Result<(), GhidraError> {
+    match std::fs::remove_file(lock) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(GhidraError::Launch(format!("releasing the analysis lock {}: {e}", lock.display()))),
+    }
 }
 
 /// The start of the folder names Ghidra gives this system's native programs (`mac_arm_64`, ...).
@@ -596,6 +637,8 @@ pub fn analyse(
     let lock = lock_path(&project_dir);
     // The lock sits beside the project, in the cache folder a fresh store doesn't have yet.
     make_private_dir(lock.parent().unwrap_or(&root))?;
+    // Why a move was refused last, so a timeout says what actually kept this waiting.
+    let mut held_by: Option<String> = None;
     // The loop ends by handing over what it moved aside, if anything.
     let kept_aside = loop {
         if is_analysed(&project_dir) {
@@ -605,7 +648,11 @@ pub fn analyse(
             return Err(GhidraError::Cancelled);
         }
         if Instant::now() >= deadline {
-            return Err(GhidraError::Timeout(format!("Ghidra's analysis didn't finish within {} s", cfg.startup_timeout.as_secs())));
+            let why = match &held_by {
+                Some(e) => format!(": the folder an earlier analysis left could not be moved out of the way ({e})"),
+                None => String::new(),
+            };
+            return Err(GhidraError::Timeout(format!("Ghidra's analysis didn't finish within {} s{why}", cfg.startup_timeout.as_secs())));
         }
         if lock_is_fresh(&lock) {
             progress(0.05, &format!("waiting for Ghidra's analysis of this program, started earlier ({} min so far)", minutes()));
@@ -613,7 +660,7 @@ pub fn analyse(
             continue;
         }
         // Stale or none: take it (create_new, so only one of two racing processes wins).
-        let _ = std::fs::remove_file(&lock);
+        release(&lock)?;
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
             Ok(_) => {}
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
@@ -626,8 +673,10 @@ pub fn analyse(
         // its own folder. A refusal to move it means that Ghidra is still working: wait for it.
         match set_aside(&project_dir) {
             Ok(aside) => break aside,
+            Err(e) if !move_may_pass(&e) => return Err(refuse_move(&lock, &project_dir, &e)),
             Err(e) => {
-                let _ = std::fs::remove_file(&lock);
+                release(&lock)?;
+                held_by = Some(e.to_string());
                 progress(0.05, &format!("waiting for the analysis of this program already under way ({e})"));
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -811,14 +860,36 @@ impl DeepDecompiler for Session {
         self.image_base
     }
 
-    fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, GhidraError> {
-        let never_cancel = || false;
-        let v = self.lock().request(
-            "native_function_pseudocode",
-            serde_json::json!({"address": format!("{entry:#x}")}),
-            &never_cancel,
-            Self::request_deadline(),
-        )?;
+    fn decompile(&self, entry: u64, waiting: &dyn Fn(&str)) -> Result<Option<DeepFunction>, GhidraError> {
+        let said = std::cell::RefCell::new(String::new());
+        // Once a minute, from the first: most decompiles take seconds and say nothing.
+        let say = |since: Instant, what: &dyn Fn(u64) -> String| {
+            let minutes = since.elapsed().as_secs() / 60;
+            let line = if minutes == 0 { return } else { what(minutes) };
+            if *said.borrow() != line {
+                waiting(&line);
+                *said.borrow_mut() = line;
+            }
+        };
+        // A decompile ahead of this one holds the bridge, for up to its own request time (#1711).
+        let queued = Instant::now();
+        let mut client = loop {
+            match self.client.try_lock() {
+                Ok(g) => break g,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    say(queued, &|m| format!("Waiting for Ghidra to finish decompiling another function ({m} min so far)"));
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
+        let asked = Instant::now();
+        let limit = REQUEST_TIME.as_secs() / 60;
+        let still = || {
+            say(asked, &|m| format!("Ghidra is decompiling this function ({m} min so far; it gives up at {limit} min)"));
+            false
+        };
+        let v = client.request("native_function_pseudocode", serde_json::json!({"address": format!("{entry:#x}")}), &still, Self::request_deadline())?;
         Ok(decompiled(entry, &v))
     }
 
