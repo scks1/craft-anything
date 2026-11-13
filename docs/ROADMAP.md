@@ -1090,10 +1090,13 @@ Owner: open · Status: todo
 A site on a platform that can't export it can be rebuilt as plain files, but its owner needs to
 know what won't come along.
 - [ ] After a website build, list what plain files can't carry over (forms, sign-ins, payments,
-      bookings), read from the capture: Clean room keeps links and form outlines. Say which
+      bookings), read from the capture: Clean room keeps links and form outlines. Copied form
+      markup isn't a working form, and a capture with no form or sign-in link doesn't show the
+      site has none, so keep "seen, not carried over" apart from "not seen". Say which
       pictures the owner has to supply: the capture saves no picture files, only their
       addresses, sizes and alt text, and the builder uses placeholders for photos and logos
-      unless the person confirms they own them
+      unless the person confirms they own them; fetching or publishing each one is a separate
+      yes
 
 ---
 
