@@ -320,7 +320,10 @@ Every round spends the person's money or quota. One that can't do anything shoul
       stop (#399): a model that changes code without ever running a build isn't caught by it.
       One shape: price each builder turn before it runs, as asset calls already are
       (`AssetProvider::estimate` against the project's asset budget, $5 by default), and stop at
-      a limit the person sets. #503's spending controls wait on R5.2's wide-PR decision too
+      a limit the person sets. That price is an estimate, so a limit that holds reserves each
+      turn's input and output allowance, counts calls in flight, in parallel and retried, and
+      settles against what the turn used; a turn whose use isn't known doesn't count as money
+      left. #503's spending controls wait on R5.2's wide-PR decision too
 - [ ] Check live that the stop fires on a real API-backend build and the message reads well. It
       fired on a local Ollama build (the same built-in loop) after two turns that changed nothing
       in `app/` ("The build stopped after two builder turns changed no files in app/…"); an
