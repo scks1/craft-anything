@@ -1090,19 +1090,23 @@ Owner: open · Status: todo
 Website checks compare the build with the original, so a faithful rebuild keeps the original's
 barriers, weight and language. A person who asks for more should get a check that holds the
 build to it.
-- [ ] An accessibility floor the person can turn on: unnamed controls, pictures without alt text
-      and a missing page language judged on the build alone. `health_notes` (`kinds/website.rs`)
+- [ ] An accessibility floor the person can turn on: unnamed controls, pictures with no `alt`
+      attribute (an empty `alt` marks a decorative picture and passes) and a missing page
+      language judged on the build alone. `health_notes` (`kinds/website.rs`)
       flags them only where the build is worse ("Problems the original has too aren't the
       build's to fix."). The `a11y` block survives Clean room (`visitor_view` keeps it).
-      Test on a page where the original and the build share a barrier
+      Passing it is a floor, not an accessibility audit. Test on a page where the original
+      and the build share a barrier
 - [ ] **decision** Whether a deliberate fix (better contrast, a named control, alt text) counts
       against likeness, and how the check tells a fix from drift
 - [ ] A page-weight limit the person sets, failing a build over it. Clean room strips the request
-      list from every capture in the session, the build's own included, so measure the built
-      files and call the result file size, not bytes downloaded
+      list from every capture in the session, the build's own included, so measure the files
+      the built site serves (not its dependencies, and not following links out of it) and call
+      the result file size, not bytes downloaded
 - [ ] When the request names a language, check the page's declared language rather than the
       original's words: the check lists missing words and the refine message tells the builder
-      to add them (`kinds/website.rs`), so a translated rebuild is told to put them back
+      to add them (`kinds/website.rs`), so a translated rebuild is told to put them back. A
+      matching declared language doesn't show the words were translated
 
 ---
 
