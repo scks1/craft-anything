@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "request": "Recreate this website",
+  "target_kind": "website",
+  "stack": "Builder's choice",
+  "status": "ready",
+  "checks": [
+    {
+      "round": 1,
+      "check": "web-visual",
+      "passed": true,
+      "similarity": 100.0,
+      "note": "1440 px: 100% alike (layout 100%, detail 100%; page height 900 vs 900 px); 768 px: 100% alike (layout 100%, detail 100%; page height 900 vs 900 px); 390 px: 100% alike (layout 100%, detail 100%; page height 1034 vs 1034 px); text 100% alike; structure 100% alike",
+      "artifacts": [
+        "checks/round-1/screenshot-1440.png",
+        "checks/round-1/screenshot-768.png",
+        "checks/round-1/screenshot-390.png"
+      ],
+      "at_ms": 1794012746880,
+      "claims": [
+        {
+          "title": "The start page doesn't scroll sideways at 1440 px",
+          "passed": true
+        },
+        {
+          "title": "The start page doesn't scroll sideways at 768 px",
+          "passed": true
+        },
+        {
+          "title": "The start page doesn't scroll sideways at 390 px",
+          "passed": true
+        },
+        {
+          "title": "The start page has the original's landmarks",
+          "passed": true
+        }
+      ]
+    }
+  ]
+}
